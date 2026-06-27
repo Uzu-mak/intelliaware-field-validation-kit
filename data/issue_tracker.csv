@@ -1,0 +1,3 @@
+Issue ID,Title,Environment,Workflow Step,Observed Behavior,Expected Behavior,Severity,Suggested Fix,Status
+ISS-001,Factory access pending,Outreach,Site recruitment,No confirmed site yet,At least one confirmed site or lab fallback,High,Continue outreach and run lab/remote MVP,Open
+ISS-002,Ground truth sync not yet tested,Lab,Data capture,Manual log and model output may not align,Shared timestamp or sync cue,Medium,Run lab rehearsal,Open

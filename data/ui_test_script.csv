@@ -1,0 +1,4 @@
+Task ID,User Role,Scenario,Task,Success Criteria,Observed Issues,Time on Task,Result
+UX-001,Operator/Maintenance,Setup,Locate setup checklist and identify first action,User can describe first setup step without help,TBD,TBD,Not tested
+UX-002,Operator/Maintenance,Monitoring,Interpret current run status,User can identify whether the process is normal or flagged,TBD,TBD,Not tested
+UX-003,Process Engineer,Handoff,Review readiness report,User can identify top issues and next action,TBD,TBD,Not tested
