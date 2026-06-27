@@ -66,8 +66,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.info(
-    "Submission framing: manufacturer access is still pending, so this MVP demonstrates the online/lab validation workflow. "
-    "When a factory site responds, its data plugs into the same workflow."
+    "This MVP is a live field-validation workspace for IntelliAware. The current evidence source may be online, lab-based, remote, simulated, or factory-based depending on access status. As manufacturer responses, lab results, trial data, and issue reports are added, the same workflow updates and produces the current readiness handoff.."
 )
 
 tabs = st.tabs([
