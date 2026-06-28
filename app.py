@@ -4,6 +4,8 @@ from datetime import datetime
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 import math
+from io import BytesIO
+import zipfile
 
 st.set_page_config(
     page_title="IntelliAware Field Validation Kit",
@@ -93,10 +95,8 @@ def clear_and_insert(table_name, df, allowed_columns):
 
     working = df.copy()
 
-    # Keep only editable database columns.
     working = working[[c for c in allowed_columns if c in working.columns]]
 
-    # Drop rows where every editable field is empty.
     if not working.empty:
         working = working.dropna(how="all")
 
@@ -108,7 +108,6 @@ def clear_and_insert(table_name, df, allowed_columns):
         for _, row in working.iterrows():
             row_dict = {col: clean_value(row[col]) for col in working.columns}
 
-            # Skip fully blank rows.
             if all(v is None or str(v).strip() == "" for v in row_dict.values()):
                 continue
 
@@ -318,6 +317,84 @@ def csv_download(df):
     return df.to_csv(index=False).encode("utf-8")
 
 
+def build_documentation_summary(export_tables):
+    project_status = export_tables.get("project_status", pd.DataFrame())
+    outreach = export_tables.get("outreach_contacts", pd.DataFrame())
+    ground_truth = export_tables.get("ground_truth_logs", pd.DataFrame())
+    issues = export_tables.get("issue_logs", pd.DataFrame())
+    ux_tests = export_tables.get("ux_test_logs", pd.DataFrame())
+    handoffs = export_tables.get("readiness_handoffs", pd.DataFrame())
+
+    latest_status_text = "No project status has been saved yet."
+
+    if not project_status.empty:
+        latest = project_status.iloc[-1]
+        latest_status_text = f"""MVP Status: {latest.get("status_label", "")}
+Current Evidence Source: {latest.get("current_evidence_source", "")}
+Manufacturer Access Status: {latest.get("manufacturer_access_status", "")}
+Next Milestone: {latest.get("next_milestone", "")}
+Updated By: {latest.get("updated_by", "")}
+Last Updated: {latest.get("last_updated", "")}"""
+
+    high_critical_issue_count = 0
+    if not issues.empty and "severity" in issues.columns:
+        high_critical_issue_count = len(
+            issues[
+                issues["severity"]
+                .astype(str)
+                .str.lower()
+                .isin(["high", "critical"])
+            ]
+        )
+
+    documentation = f"""# IntelliAware Field Validation Kit — Project Documentation Export
+
+Generated: {datetime.now().isoformat()}
+
+## Current Project Status
+
+{latest_status_text}
+
+## Record Counts
+
+- Project status records: {len(project_status)}
+- Outreach contacts: {len(outreach)}
+- Ground-truth logs: {len(ground_truth)}
+- Issue logs: {len(issues)}
+- High/Critical issue count: {high_critical_issue_count}
+- UI/UX test records: {len(ux_tests)}
+- Readiness handoffs: {len(handoffs)}
+
+## Product Framing
+
+This MVP is a live field-validation workspace for IntelliAware. The current evidence source may be online, lab-based, remote, simulated, or factory-based depending on access status. As manufacturer responses, lab results, trial data, and issue reports are added, the same workflow updates and produces the current readiness handoff.
+
+## Export Notes
+
+This export summarizes the current state of the live PostgreSQL-backed MVP. The full records are included as CSV files in the export archive or can be downloaded individually from the Export Center.
+"""
+
+    return documentation
+
+
+def build_export_zip(export_tables):
+    buffer = BytesIO()
+
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for table_name, df in export_tables.items():
+            csv_bytes = df.to_csv(index=False).encode("utf-8")
+            zip_file.writestr(f"{table_name}.csv", csv_bytes)
+
+        documentation = build_documentation_summary(export_tables)
+        zip_file.writestr(
+            "intelliaware_documentation_summary.md",
+            documentation.encode("utf-8")
+        )
+
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 # -----------------------------
 # Header
 # -----------------------------
@@ -406,7 +483,8 @@ tabs = st.tabs([
     "4. Ground Truth Log",
     "5. Issue Tracker",
     "6. UI/UX Test Script",
-    "7. Readiness Handoff"
+    "7. Readiness Handoff",
+    "8. Export Center"
 ])
 
 
@@ -542,6 +620,7 @@ with tabs[1]:
     - Issue severity tracker
     - UI/UX task script
     - Readiness handoff structure
+    - Export Center for downloading records and documentation
     """)
 
 
@@ -896,6 +975,69 @@ Generated: {datetime.now().isoformat()}
 
     st.subheader("Saved readiness handoffs")
     st.dataframe(read_table("readiness_handoffs"), use_container_width=True)
+
+
+# -----------------------------
+# 8. Export Center
+# -----------------------------
+
+with tabs[8]:
+    st.subheader("Export Center")
+    st.markdown(
+        "Download the current project records from PostgreSQL for submission, backup, future documentation, or handoff to the IntelliAware research team."
+    )
+
+    export_tables = {
+        "project_status": read_table("project_status"),
+        "outreach_contacts": read_table("outreach_contacts"),
+        "ground_truth_logs": read_table("ground_truth_logs"),
+        "issue_logs": read_table("issue_logs"),
+        "ux_test_logs": read_table("ux_test_logs"),
+        "readiness_handoffs": read_table("readiness_handoffs"),
+    }
+
+    st.subheader("Database record counts")
+
+    count_df = pd.DataFrame(
+        [
+            {"Table": table_name, "Records": len(df)}
+            for table_name, df in export_tables.items()
+        ]
+    )
+
+    st.dataframe(count_df, use_container_width=True, hide_index=True)
+
+    st.subheader("Download individual tables")
+
+    for table_name, df in export_tables.items():
+        st.download_button(
+            label=f"Download {table_name}.csv",
+            data=df.to_csv(index=False).encode("utf-8"),
+            file_name=f"{table_name}.csv",
+            mime="text/csv"
+        )
+
+    st.subheader("Download full project archive")
+
+    documentation = build_documentation_summary(export_tables)
+    archive = build_export_zip(export_tables)
+
+    st.download_button(
+        label="Download documentation summary.md",
+        data=documentation,
+        file_name="intelliaware_documentation_summary.md",
+        mime="text/markdown"
+    )
+
+    st.download_button(
+        label="Download full PostgreSQL export ZIP",
+        data=archive,
+        file_name=f"intelliaware_postgres_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+        mime="application/zip"
+    )
+
+    st.subheader("Documentation preview")
+    st.markdown(documentation)
 
 
 st.divider()
