@@ -495,8 +495,7 @@ tabs = st.tabs([
 with tabs[0]:
     st.subheader("Project Status")
     st.markdown(
-        "Use this page to update the live framing shown on the homepage. "
-        "This prevents the MVP from sounding static as manufacturer access and evidence sources change."
+        "Manage the current project status, evidence source, manufacturer access status, and next milestone."
     )
 
     col1, col2 = st.columns(2)
