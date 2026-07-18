@@ -1,4 +1,6 @@
-streamlit
-pandas
-sqlalchemy
-psycopg2-binary
+streamlit>=1.42,<2
+pandas>=2.2,<3
+SQLAlchemy>=2.0,<3
+psycopg[binary]>=3.2,<4
+streamlit-cookies-controller==0.0.4
+argon2-cffi>=23.1,<26
