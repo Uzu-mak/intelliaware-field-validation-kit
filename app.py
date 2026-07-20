@@ -485,6 +485,13 @@ def init_schema():
     ALTER TABLE notifications ADD COLUMN IF NOT EXISTS recipient_user_id BIGINT REFERENCES users(id) ON DELETE CASCADE;
     ALTER TABLE notifications ADD COLUMN IF NOT EXISTS sender_user_id BIGINT REFERENCES users(id);
     ALTER TABLE notifications ADD COLUMN IF NOT EXISTS link_page TEXT;
+    ALTER TABLE meetings ADD COLUMN IF NOT EXISTS calendar_provider TEXT NOT NULL DEFAULT 'Internal';
+    ALTER TABLE meetings ADD COLUMN IF NOT EXISTS delivery_status TEXT NOT NULL DEFAULT 'Not sent';
+    ALTER TABLE meetings ADD COLUMN IF NOT EXISTS provider_event_id TEXT;
+    ALTER TABLE meetings ADD COLUMN IF NOT EXISTS invite_sent_at TIMESTAMPTZ;
+    ALTER TABLE meetings ADD COLUMN IF NOT EXISTS delivery_error TEXT;
+    ALTER TABLE meetings ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+    ALTER TABLE activity_log ADD COLUMN IF NOT EXISTS hidden BOOLEAN NOT NULL DEFAULT FALSE;
     """
     execute(alter_sql)
 
@@ -744,6 +751,66 @@ def notify_meeting_participants(meeting_id: int, organizer_user_id: int, title: 
     execute("UPDATE meeting_participants SET notified_at=CURRENT_TIMESTAMP WHERE meeting_id=:mid", {"mid": meeting_id})
 
 
+def send_meeting_creation_messages(meeting_id: int, organizer_user_id: int):
+    """Send one private in-app message to each participant when a meeting is created."""
+    meeting = fetch_one("SELECT * FROM meetings WHERE id=:id", {"id": meeting_id})
+    organizer = user_by_id(organizer_user_id) or {}
+    if not meeting:
+        return
+
+    start_at = pd.to_datetime(meeting.get("start_at"), errors="coerce")
+    end_at = pd.to_datetime(meeting.get("end_at"), errors="coerce")
+    when_text = ""
+    if not pd.isna(start_at):
+        when_text = start_at.strftime("%b %d, %Y at %I:%M %p")
+        if not pd.isna(end_at):
+            when_text += f"–{end_at.strftime('%I:%M %p')}"
+        when_text += f" ({meeting.get('timezone_name') or 'UTC'})"
+
+    details = [
+        f"You have been added to the meeting: {meeting.get('title') or 'Meeting'}.",
+        f"Organizer: {organizer.get('display_name') or organizer.get('email') or 'ValidationOps user'}",
+    ]
+    if when_text:
+        details.append(f"When: {when_text}")
+    if meeting.get("location"):
+        details.append(f"Location: {meeting['location']}")
+    if meeting.get("meeting_url"):
+        details.append(f"Meeting link: {meeting['meeting_url']}")
+    if meeting.get("agenda"):
+        details.append(f"Agenda: {meeting['agenda']}")
+    details.append("Open Meetings in ValidationOps to review the invitation, respond, or download the calendar file.")
+    body = "\n\n".join(details)
+
+    rows = query_df("""
+        SELECT mp.user_id
+        FROM meeting_participants mp
+        JOIN users u ON u.id=mp.user_id
+        WHERE mp.meeting_id=:mid AND u.active=TRUE AND mp.user_id<>:organizer
+    """, {"mid": meeting_id, "organizer": organizer_user_id})
+
+    for _, row in rows.iterrows():
+        recipient_id = int(row["user_id"])
+        message_id = insert_private_message({
+            "sender_user_id": organizer_user_id,
+            "recipient_user_id": recipient_id,
+            "subject": f"Meeting scheduled: {meeting.get('title') or 'Meeting'}",
+            "body": body,
+            "related_entity_type": "meetings",
+            "related_entity_id": meeting_id,
+        })
+        create_notification(
+            recipient_id,
+            f"Meeting scheduled by {organizer.get('display_name') or 'a team member'}",
+            f"{meeting.get('title') or 'Meeting'} — {when_text or 'Open Meetings for details.'}",
+            "direct_messages",
+            message_id,
+            organizer_user_id,
+            "Messages",
+        )
+    execute("UPDATE meeting_participants SET notified_at=CURRENT_TIMESTAMP WHERE meeting_id=:mid", {"mid": meeting_id})
+
+
 def parse_optional_date(value):
     if value is None or value == "":
         return None
@@ -821,6 +888,83 @@ def user_by_id(user_id: int | None):
         return None
     return fetch_one("SELECT id, email, display_name, role, active FROM users WHERE id=:id", {"id": user_id})
 
+
+
+def activity_entity_label(entity_type: str | None) -> str:
+    labels = {
+        "projects": "Project",
+        "project_teams": "Project team",
+        "workstreams": "Workstream",
+        "teams": "Team",
+        "team_memberships": "Team membership",
+        "tasks": "Task",
+        "milestones": "Milestone",
+        "risks": "Risk",
+        "trials": "Trial",
+        "evidence_items": "Evidence",
+        "issue_logs": "Issue",
+        "outreach_contacts": "Outreach",
+        "baseline_metrics": "Metric",
+        "readiness_criteria": "Readiness criterion",
+        "readiness_handoffs": "Readiness handoff",
+        "meetings": "Meeting",
+        "notifications": "Notification",
+        "team_messages": "Team message",
+        "users": "User account",
+    }
+    key = str(entity_type or "").lower()
+    return labels.get(key, key.replace("_", " ").title() or "Activity")
+
+
+def activity_action_label(action: str | None) -> str:
+    labels = {
+        "create": "Created",
+        "update": "Updated",
+        "delete": "Removed",
+        "team_assignment": "Team assigned",
+        "status_change": "Status changed",
+        "baseline": "Imported",
+    }
+    key = str(action or "").lower()
+    return labels.get(key, key.replace("_", " ").title() or "Activity")
+
+
+def activity_target_page(entity_type: str | None) -> str:
+    """Return the most relevant application page for an activity entity."""
+    mapping = {
+        "projects": "Projects",
+        "project_teams": "Projects",
+        "workstreams": "Workstreams",
+        "teams": "Workstreams",
+        "team_memberships": "Workstreams",
+        "team_members": "Workstreams",
+        "tasks": "My Work",
+        "milestones": "Milestones & Risks",
+        "risks": "Milestones & Risks",
+        "trials": "Trials",
+        "evidence_items": "Evidence",
+        "issue_logs": "Issues",
+        "outreach_contacts": "Outreach",
+        "baseline_metrics": "Analytics & Readiness",
+        "readiness_criteria": "Analytics & Readiness",
+        "readiness_handoffs": "Analytics & Readiness",
+        "meetings": "Meetings",
+        "notifications": "Notifications",
+        "direct_messages": "Messages",
+        "team_messages": "Messages",
+        "users": "Administration",
+        "app_sessions": "Administration",
+    }
+    return mapping.get(str(entity_type or "").lower(), "Activity")
+
+
+def open_activity_target(entity_type: str | None, entity_id: int | None = None):
+    target = activity_target_page(entity_type)
+    st.session_state.current_page = target
+    st.query_params["page"] = target
+    if entity_id is not None:
+        st.query_params["record_id"] = str(int(entity_id))
+    st.rerun()
 
 # -----------------------------
 # Startup + access
@@ -1266,8 +1410,10 @@ if page == "Dashboard":
             LEFT JOIN users sender ON sender.id=dm.sender_user_id
             LEFT JOIN users recipient ON recipient.id=dm.recipient_user_id
             LEFT JOIN team_messages tmsg ON a.entity_type='team_messages' AND tmsg.id=a.entity_id
-            WHERE a.entity_type <> 'direct_messages'
-              AND (a.entity_type <> 'team_messages' OR :activity_is_admin OR EXISTS (
+            WHERE COALESCE(a.hidden,FALSE)=FALSE
+              AND a.entity_type <> 'direct_messages'
+              AND (a.entity_type <> 'meetings' OR EXISTS (SELECT 1 FROM meetings mx WHERE mx.id=a.entity_id AND mx.deleted_at IS NULL AND mx.status <> 'Cancelled'))
+          AND (a.entity_type <> 'team_messages' OR :activity_is_admin OR EXISTS (
                     SELECT 1 FROM team_memberships tm
                     WHERE tm.team_id=tmsg.team_id AND tm.user_id=:activity_user_id AND tm.active=TRUE
               ))
@@ -1276,7 +1422,12 @@ if page == "Dashboard":
         """, {"activity_user_id": actor_id, "activity_is_admin": current_user["role"] == "Administrator"})
         if activity.empty: st.caption("No activity recorded.")
         for _, r in activity.iterrows():
-            st.markdown(f"**{safe_text(r['action']).title()}** · {safe_text(r['entity_type'])}  \n{safe_text(r.get('display_description'), '')}  \n<span class='muted'>{r['created_at']} · {safe_text(r.get('performed_by'), 'System')}</span>", unsafe_allow_html=True)
+            action_label = activity_action_label(r.get("action"))
+            entity_label = activity_entity_label(r.get("entity_type"))
+            st.markdown(f"**{action_label} · {entity_label}**  \n{safe_text(r.get('display_description'), '')}  \n<span class='muted'>{r['created_at']} · {safe_text(r.get('performed_by'), 'System')}</span>", unsafe_allow_html=True)
+            target_page = activity_target_page(r.get("entity_type"))
+            if st.button(f"Open {entity_label}", key=f"dashboard_activity_{int(r['id'])}", use_container_width=False):
+                open_activity_target(r.get("entity_type"), r.get("entity_id"))
             st.divider()
 
 # -----------------------------
@@ -1913,27 +2064,112 @@ elif page == "Outreach":
 # Notifications
 # -----------------------------
 elif page == "Meetings":
-    st.markdown("### Meetings and calendar invitations")
-    st.caption("Schedule operational meetings, notify participants in-app, and download a standard calendar invitation for Outlook, Google Calendar, or Apple Calendar.")
+    st.markdown("### Meetings")
+    st.caption("Schedule meetings, notify participants in-app, and provide a standard calendar invitation file.")
 
-    meeting_tabs = st.tabs(["Schedule", "Upcoming", "Past / cancelled"])
+    if "meetings_view" not in st.session_state:
+        st.session_state.meetings_view = "Upcoming"
+    if "meeting_form_version" not in st.session_state:
+        st.session_state.meeting_form_version = 0
+    meeting_view = st.radio(
+        "Meeting view",
+        ["Upcoming", "Schedule meeting", "Past / cancelled"],
+        horizontal=True,
+        key="meetings_view",
+        label_visibility="collapsed",
+    )
+
     active_users_df = query_df("SELECT id, display_name, email FROM users WHERE active=TRUE ORDER BY display_name, email")
     user_label_to_id = {f"{r['display_name']} · {r['email']}": int(r['id']) for _, r in active_users_df.iterrows()}
     timezone_options = ["America/Detroit", "America/New_York", "America/Chicago", "America/Denver", "America/Los_Angeles", "UTC"]
 
-    with meeting_tabs[0]:
+    def render_meeting_rows(rows):
+        if rows.empty:
+            st.caption("No meetings in this section.")
+            return
+        for _, m in rows.iterrows():
+            participant_df = query_df("""
+                SELECT u.id,u.display_name,u.email,mp.response_status
+                FROM meeting_participants mp JOIN users u ON u.id=mp.user_id
+                WHERE mp.meeting_id=:mid ORDER BY u.display_name
+            """, {"mid": int(m["id"])})
+            participants = participant_df.to_dict("records")
+            names = ", ".join(safe_text(x.get("display_name"), "User") for x in participants) or "No participants"
+            start_display = pd.to_datetime(m["start_at"]).strftime("%b %d, %Y %I:%M %p %Z")
+            render_card(
+                safe_text(m.get("title"), "Meeting"),
+                f"{start_display} · Organizer: {safe_text(m.get('organizer_name'))}",
+                [m.get("status"), safe_text(m.get("team_name"), "No team")],
+                f"<strong>Participants:</strong> {html.escape(names)}<br><strong>Location:</strong> {html.escape(safe_text(m.get('location') or m.get('meeting_url'), 'Not specified'))}",
+            )
+            with st.expander("Open meeting"):
+                st.write(f"**Agenda:** {safe_text(m.get('agenda'), 'No agenda provided')}")
+                if m.get("meeting_url"):
+                    st.link_button("Open meeting link", m.get("meeting_url"))
+                response_row = next((x for x in participants if int(x["id"]) == actor_id), None)
+                if response_row and m.get("status") == "Scheduled":
+                    response_options = ["Needs action", "Accepted", "Tentative", "Declined"]
+                    current_response = response_row.get("response_status") if response_row.get("response_status") in response_options else "Needs action"
+                    new_response = st.selectbox("Your response", response_options, index=response_options.index(current_response), key=f"meeting_response_{m['id']}")
+                    if st.button("Save response", key=f"save_meeting_response_{m['id']}"):
+                        execute("UPDATE meeting_participants SET response_status=:status WHERE meeting_id=:mid AND user_id=:uid", {"status": new_response, "mid": int(m["id"]), "uid": actor_id})
+                        create_notification(int(m["organizer_user_id"]), f"Meeting response from {actor}", f"{actor} responded {new_response} to {m['title']}.", "meetings", int(m["id"]), actor_id, "Meetings")
+                        st.session_state.meeting_flash = "Response saved."
+                        st.rerun()
+                ics_bytes = build_meeting_ics(dict(m), participants)
+                safe_filename = re.sub(r"[^A-Za-z0-9_-]+", "_", str(m.get("title") or "meeting")).strip("_") or "meeting"
+                st.download_button("Download calendar invitation (.ics)", ics_bytes, file_name=f"{safe_filename}.ics", mime="text/calendar", key=f"ics_{m['id']}")
+                can_manage = current_user["role"] == "Administrator" or int(m["organizer_user_id"]) == actor_id or (m.get("team_id") and user_leads_team(actor_id, int(m["team_id"])))
+                if can_manage and m.get("status") == "Scheduled":
+                    with st.form(f"edit_meeting_{m['id']}"):
+                        edit_title = st.text_input("Title", value=m.get("title") or "")
+                        edit_location = st.text_input("Location", value=m.get("location") or "")
+                        edit_url = st.text_input("Meeting link", value=m.get("meeting_url") or "")
+                        edit_agenda = st.text_area("Agenda", value=m.get("agenda") or "")
+                        save_edit = st.form_submit_button("Save meeting changes")
+                    if save_edit:
+                        update_record("meetings", int(m["id"]), {"title": edit_title.strip(), "location": edit_location.strip() or None, "meeting_url": normalize_evidence_url(edit_url) if edit_url.strip() else None, "agenda": edit_agenda.strip(), "updated_at": datetime.now(timezone.utc)}, actor, f"Meeting '{edit_title.strip()}' updated")
+                        notify_meeting_participants(int(m["id"]), actor_id, f"Meeting updated: {edit_title.strip()}", "Meeting details were updated. Open Meetings to review the changes.")
+                        st.session_state.meeting_flash = "Meeting updated. Participants were notified in-app; download a refreshed calendar file when needed."
+                        st.rerun()
+                    if st.button("Cancel meeting", key=f"cancel_meeting_{m['id']}"):
+                        update_record("meetings", int(m["id"]), {"status": "Cancelled", "updated_at": datetime.now(timezone.utc)}, actor, f"Meeting '{m['title']}' cancelled")
+                        notify_meeting_participants(int(m["id"]), actor_id, f"Meeting cancelled: {m['title']}", "The meeting has been cancelled.")
+                        # Cancelled meeting activity should not remain on the Dashboard.
+                        execute("UPDATE activity_log SET hidden=TRUE WHERE entity_type='meetings' AND entity_id=:id", {"id": int(m["id"])})
+                        st.session_state.meeting_flash = "Meeting cancelled and removed from the Dashboard activity feed."
+                        st.rerun()
+                    if st.button("Remove meeting from ValidationOps", key=f"remove_meeting_{m['id']}", help="Soft-removes the meeting without deleting historical database rows."):
+                        execute("UPDATE meetings SET deleted_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=:id", {"id": int(m["id"])})
+                        execute("UPDATE activity_log SET hidden=TRUE WHERE entity_type='meetings' AND entity_id=:id", {"id": int(m["id"])})
+                        notify_meeting_participants(int(m["id"]), actor_id, f"Meeting removed: {m['title']}", "The meeting was removed from the active ValidationOps schedule.")
+                        st.session_state.meeting_flash = "Meeting removed from meeting lists and activity feeds. Historical data was preserved."
+                        st.rerun()
+
+    if st.session_state.get("meeting_flash"):
+        st.success(st.session_state.pop("meeting_flash"))
+
+    visibility_sql = "TRUE" if current_user["role"] == "Administrator" else "(m.organizer_user_id=:uid OR EXISTS(SELECT 1 FROM meeting_participants mp WHERE mp.meeting_id=m.id AND mp.user_id=:uid))"
+    base_query = f"""
+        SELECT m.*,u.display_name organizer_name,t.name team_name
+        FROM meetings m JOIN users u ON u.id=m.organizer_user_id
+        LEFT JOIN teams t ON t.id=m.team_id
+        WHERE {visibility_sql} AND m.deleted_at IS NULL
+    """
+    params = {} if current_user["role"] == "Administrator" else {"uid": actor_id}
+
+    if meeting_view == "Schedule meeting":
         can_schedule = can_edit or user_leads_team(actor_id)
         if not can_schedule:
             st.info("Write access or Team Lead responsibility is required to schedule meetings.")
         else:
             schedule_team_map = user_team_options(actor_id)
-            with st.form("schedule_meeting_form"):
+            form_key = f"schedule_meeting_form_{st.session_state.meeting_form_version}"
+            with st.form(form_key):
                 c1, c2 = st.columns(2)
                 meeting_title = c1.text_input("Meeting title")
                 meeting_team_label = c2.selectbox("Team", ["No team"] + list(schedule_team_map))
                 selected_meeting_team_id = schedule_team_map.get(meeting_team_label)
-                if current_user["role"] != "Administrator" and selected_meeting_team_id and not user_leads_team(actor_id, selected_meeting_team_id) and current_user.get("access_level") != "Write":
-                    st.warning("You may schedule only for teams you lead.")
                 pmap = project_options()
                 project_label = c1.selectbox("Related project", ["No project"] + list(pmap))
                 meeting_project_id = pmap.get(project_label)
@@ -1965,15 +2201,15 @@ elif page == "Meetings":
                 participant_ids.add(actor_id)
                 if not meeting_title.strip():
                     st.error("Meeting title is required.")
-                elif not start_at or not end_at or end_at <= start_at:
+                elif end_at <= start_at:
                     st.error("The end date and time must be after the start date and time.")
                 elif selected_meeting_team_id and current_user["role"] != "Administrator" and not user_leads_team(actor_id, selected_meeting_team_id) and current_user.get("access_level") != "Write":
                     st.error("You are not authorized to schedule for this team.")
                 else:
                     with get_engine().begin() as conn:
                         meeting_id = int(conn.execute(text("""
-                            INSERT INTO meetings(calendar_uid,title,agenda,organizer_user_id,team_id,project_id,related_entity_type,related_entity_id,start_at,end_at,timezone_name,location,meeting_url,status)
-                            VALUES(:uid,:title,:agenda,:organizer,:team_id,:project_id,:related_type,:related_id,:start_at,:end_at,:timezone_name,:location,:meeting_url,'Scheduled') RETURNING id
+                            INSERT INTO meetings(calendar_uid,title,agenda,organizer_user_id,team_id,project_id,related_entity_type,related_entity_id,start_at,end_at,timezone_name,location,meeting_url,status,delivery_status)
+                            VALUES(:uid,:title,:agenda,:organizer,:team_id,:project_id,:related_type,:related_id,:start_at,:end_at,:timezone_name,:location,:meeting_url,'Scheduled','Internal') RETURNING id
                         """), {
                             "uid": f"{uuid.uuid4()}@validationops.intelliaware", "title": meeting_title.strip(), "agenda": agenda.strip(),
                             "organizer": actor_id, "team_id": selected_meeting_team_id, "project_id": meeting_project_id,
@@ -1987,72 +2223,16 @@ elif page == "Meetings":
                                 ON CONFLICT(meeting_id,user_id) DO NOTHING
                             """), {"mid": meeting_id, "uid": uid, "status": "Accepted" if uid == actor_id else "Needs action"})
                         log_activity(conn, "meetings", meeting_id, "create", f"Meeting '{meeting_title.strip()}' scheduled", actor)
-                    notify_meeting_participants(meeting_id, actor_id, f"Meeting invitation: {meeting_title.strip()}", f"Scheduled for {start_at.strftime('%b %d, %Y %I:%M %p')} {tz_name}.")
-                    st.success("Meeting scheduled. Participants were notified in-app. Open Upcoming to download the calendar invitation.")
+                    send_meeting_creation_messages(meeting_id, actor_id)
+                    st.session_state.meeting_form_version += 1
+                    st.session_state.meetings_view = "Upcoming"
+                    st.session_state.meeting_flash = "Meeting scheduled. Participants received a private in-app message. The calendar file is available from the meeting card."
                     st.rerun()
 
-    def render_meeting_rows(rows):
-        if rows.empty:
-            st.caption("No meetings in this section.")
-            return
-        for _, m in rows.iterrows():
-            participant_df = query_df("""
-                SELECT u.id,u.display_name,u.email,mp.response_status
-                FROM meeting_participants mp JOIN users u ON u.id=mp.user_id
-                WHERE mp.meeting_id=:mid ORDER BY u.display_name
-            """, {"mid": int(m["id"])})
-            participants = participant_df.to_dict("records")
-            names = ", ".join(safe_text(x.get("display_name"), "User") for x in participants) or "No participants"
-            start_display = pd.to_datetime(m["start_at"]).strftime("%b %d, %Y %I:%M %p %Z")
-            render_card(safe_text(m.get("title"), "Meeting"), f"{start_display} · Organizer: {safe_text(m.get('organizer_name'))}", [m.get("status"), safe_text(m.get("team_name"), "No team")], f"<strong>Participants:</strong> {names}<br><strong>Location:</strong> {safe_text(m.get('location') or m.get('meeting_url'), 'Not specified')}")
-            with st.expander("Open meeting"):
-                st.write(f"**Agenda:** {safe_text(m.get('agenda'), 'No agenda provided')}")
-                if m.get("meeting_url"):
-                    st.link_button("Open meeting link", m.get("meeting_url"))
-                response_row = next((x for x in participants if int(x["id"]) == actor_id), None)
-                if response_row and m.get("status") == "Scheduled":
-                    response_options = ["Needs action", "Accepted", "Tentative", "Declined"]
-                    current_response = response_row.get("response_status") if response_row.get("response_status") in response_options else "Needs action"
-                    new_response = st.selectbox("Your response", response_options, index=response_options.index(current_response), key=f"meeting_response_{m['id']}")
-                    if st.button("Save response", key=f"save_meeting_response_{m['id']}"):
-                        execute("UPDATE meeting_participants SET response_status=:status WHERE meeting_id=:mid AND user_id=:uid", {"status": new_response, "mid": int(m["id"]), "uid": actor_id})
-                        create_notification(int(m["organizer_user_id"]), f"Meeting response from {actor}", f"{actor} responded {new_response} to {m['title']}.", "meetings", int(m["id"]), actor_id, "Meetings")
-                        st.success("Response saved.")
-                        st.rerun()
-                ics_bytes = build_meeting_ics(dict(m), participants)
-                safe_filename = re.sub(r"[^A-Za-z0-9_-]+", "_", str(m.get("title") or "meeting")).strip("_") or "meeting"
-                st.download_button("Download Outlook / calendar invite (.ics)", ics_bytes, file_name=f"{safe_filename}.ics", mime="text/calendar", key=f"ics_{m['id']}")
-                can_manage = current_user["role"] == "Administrator" or int(m["organizer_user_id"]) == actor_id or (m.get("team_id") and user_leads_team(actor_id, int(m["team_id"])))
-                if can_manage and m.get("status") == "Scheduled":
-                    with st.form(f"edit_meeting_{m['id']}"):
-                        edit_title = st.text_input("Title", value=m.get("title") or "")
-                        edit_location = st.text_input("Location", value=m.get("location") or "")
-                        edit_url = st.text_input("Meeting link", value=m.get("meeting_url") or "")
-                        edit_agenda = st.text_area("Agenda", value=m.get("agenda") or "")
-                        save_edit = st.form_submit_button("Save meeting changes")
-                    if save_edit:
-                        update_record("meetings", int(m["id"]), {"title": edit_title.strip(), "location": edit_location.strip() or None, "meeting_url": normalize_evidence_url(edit_url) if edit_url.strip() else None, "agenda": edit_agenda.strip(), "updated_at": datetime.now(timezone.utc)}, actor, f"Meeting '{edit_title.strip()}' updated")
-                        notify_meeting_participants(int(m["id"]), actor_id, f"Meeting updated: {edit_title.strip()}", "Meeting details were updated. Open Meetings to review the changes.")
-                        st.success("Meeting updated and participants notified.")
-                        st.rerun()
-                    if st.button("Cancel meeting", key=f"cancel_meeting_{m['id']}"):
-                        update_record("meetings", int(m["id"]), {"status": "Cancelled", "updated_at": datetime.now(timezone.utc)}, actor, f"Meeting '{m['title']}' cancelled")
-                        notify_meeting_participants(int(m["id"]), actor_id, f"Meeting cancelled: {m['title']}", "The meeting has been cancelled.")
-                        st.warning("Meeting cancelled and participants notified.")
-                        st.rerun()
-
-    visibility_sql = "TRUE" if current_user["role"] == "Administrator" else "(m.organizer_user_id=:uid OR EXISTS(SELECT 1 FROM meeting_participants mp WHERE mp.meeting_id=m.id AND mp.user_id=:uid))"
-    base_query = f"""
-        SELECT m.*,u.display_name organizer_name,t.name team_name
-        FROM meetings m JOIN users u ON u.id=m.organizer_user_id
-        LEFT JOIN teams t ON t.id=m.team_id
-        WHERE {visibility_sql}
-    """
-    params = {} if current_user["role"] == "Administrator" else {"uid": actor_id}
-    with meeting_tabs[1]:
+    elif meeting_view == "Upcoming":
         upcoming = query_df(base_query + " AND m.status='Scheduled' AND m.end_at>=CURRENT_TIMESTAMP ORDER BY m.start_at", params)
         render_meeting_rows(upcoming)
-    with meeting_tabs[2]:
+    else:
         past = query_df(base_query + " AND (m.status='Cancelled' OR m.end_at<CURRENT_TIMESTAMP) ORDER BY m.start_at DESC", params)
         render_meeting_rows(past)
 
@@ -2446,7 +2626,7 @@ elif page == "Activity":
     entity=st.text_input("Filter entity type")
     actor_filter=st.text_input("Filter person")
     sql="""
-        SELECT a.id, a.created_at, a.action, a.entity_type,
+        SELECT a.id, a.entity_id, a.created_at, a.action, a.entity_type,
                CASE
                  WHEN a.entity_type='direct_messages' AND dm.id IS NOT NULL THEN
                    'Direct message from ' || COALESCE(sender.display_name, sender.email, 'Unknown user') ||
@@ -2460,7 +2640,12 @@ elif page == "Activity":
         LEFT JOIN users sender ON sender.id=dm.sender_user_id
         LEFT JOIN users recipient ON recipient.id=dm.recipient_user_id
         LEFT JOIN team_messages tmsg ON a.entity_type='team_messages' AND tmsg.id=a.entity_id
-        WHERE a.entity_type <> 'direct_messages'
+        WHERE COALESCE(a.hidden,FALSE)=FALSE
+          AND a.entity_type <> 'direct_messages'
+          AND (a.entity_type <> 'meetings' OR EXISTS (
+                SELECT 1 FROM meetings mx
+                WHERE mx.id=a.entity_id AND mx.deleted_at IS NULL AND mx.status <> 'Cancelled'
+          ))
           AND (a.entity_type <> 'team_messages' OR :activity_is_admin OR EXISTS (
                 SELECT 1 FROM team_memberships tm
                 WHERE tm.team_id=tmsg.team_id AND tm.user_id=:activity_user_id AND tm.active=TRUE
@@ -2469,7 +2654,29 @@ elif page == "Activity":
     if entity: sql+=" AND a.entity_type ILIKE :e"; params["e"]=f"%{entity}%"
     if actor_filter: sql+=" AND a.performed_by ILIKE :a"; params["a"]=f"%{actor_filter}%"
     sql+=" ORDER BY a.created_at DESC LIMIT 500"
-    st.dataframe(query_df(sql,params),use_container_width=True,hide_index=True)
+    activity_rows = query_df(sql, params)
+    if activity_rows.empty:
+        st.info("No activity matches the selected filters.")
+    else:
+        for _, row in activity_rows.iterrows():
+            c1, c2 = st.columns([5, 1])
+            with c1:
+                action_label = activity_action_label(row.get("action"))
+                entity_label = activity_entity_label(row.get("entity_type"))
+                st.markdown(
+                    f"**{action_label} · {entity_label}**  \n"
+                    f"{safe_text(row.get('description'), '')}  \n"
+                    f"<span class='muted'>{row.get('created_at')} · {safe_text(row.get('performed_by'), 'System')}</span>",
+                    unsafe_allow_html=True,
+                )
+            with c2:
+                if st.button(f"Open {entity_label}", key=f"activity_open_{int(row['id'])}", use_container_width=True):
+                    open_activity_target(row.get("entity_type"), row.get("entity_id"))
+                if current_user["role"] == "Administrator" and st.button("Hide", key=f"activity_hide_{int(row['id'])}", use_container_width=True):
+                    execute("UPDATE activity_log SET hidden=TRUE WHERE id=:id", {"id": int(row["id"])})
+                    st.success("Activity removed from shared feeds.")
+                    st.rerun()
+            st.divider()
 
 # -----------------------------
 # Administration / migration
