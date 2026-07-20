@@ -1,5 +1,6 @@
 import json
 import math
+import re
 import hashlib
 import hmac
 import html
@@ -466,7 +467,24 @@ def normalize_evidence_url(value: str | None) -> str | None:
 
 
 def safe_text(value: Any, fallback: str = "—") -> str:
-    text_value = str(value or "").strip()
+    """Render legacy/user text safely without exposing stored HTML fragments."""
+    text_value = html.unescape(str(value or "")).strip()
+    if not text_value:
+        return fallback
+
+    # Some legacy outreach values accidentally contain the remainder of an old
+    # HTML card. Preserve the actual value before the first tag and discard the
+    # injected layout markup. When the value starts with a tag, strip tags and
+    # retain only readable text. This changes presentation only; stored rows are
+    # not deleted or rewritten.
+    if "<" in text_value and ">" in text_value:
+        leading_value = text_value.split("<", 1)[0].strip()
+        if leading_value:
+            text_value = leading_value
+        else:
+            text_value = re.sub(r"<[^>]*>", " ", text_value)
+            text_value = re.sub(r"\s+", " ", text_value).strip()
+
     return html.escape(text_value) if text_value else fallback
 
 
@@ -1011,10 +1029,25 @@ if page == "Dashboard":
                 render_card(r["name"], f"Owner: {r.get('owner') or 'Unassigned'}", [r.get("phase") or "", r.get("status") or "", f"{ws_count} workstreams", f"{task_count} tasks"], r.get("description") or "")
     with right:
         st.markdown("### Recent activity")
-        activity = query_df("SELECT * FROM activity_log ORDER BY created_at DESC LIMIT 12")
+        activity = query_df("""
+            SELECT a.*,
+                   CASE
+                     WHEN a.entity_type='direct_messages' AND dm.id IS NOT NULL THEN
+                       'Direct message from ' || COALESCE(sender.display_name, sender.email, 'Unknown user') ||
+                       ' to ' || COALESCE(recipient.display_name, recipient.email, 'Unknown user') ||
+                       CASE WHEN COALESCE(dm.subject, '') <> '' THEN ': ' || dm.subject ELSE '' END
+                     ELSE a.description
+                   END AS display_description
+            FROM activity_log a
+            LEFT JOIN direct_messages dm ON a.entity_type='direct_messages' AND dm.id=a.entity_id
+            LEFT JOIN users sender ON sender.id=dm.sender_user_id
+            LEFT JOIN users recipient ON recipient.id=dm.recipient_user_id
+            ORDER BY a.created_at DESC
+            LIMIT 12
+        """)
         if activity.empty: st.caption("No activity recorded.")
         for _, r in activity.iterrows():
-            st.markdown(f"**{r['action'].title()}** · {r['entity_type']}  \n{r.get('description') or ''}  \n<span class='muted'>{r['created_at']} · {r.get('performed_by') or 'System'}</span>", unsafe_allow_html=True)
+            st.markdown(f"**{safe_text(r['action']).title()}** · {safe_text(r['entity_type'])}  \n{safe_text(r.get('display_description'), '')}  \n<span class='muted'>{r['created_at']} · {safe_text(r.get('performed_by'), 'System')}</span>", unsafe_allow_html=True)
             st.divider()
 
 # -----------------------------
@@ -1663,9 +1696,55 @@ elif page == "Notifications":
         for _, n in notifications.iterrows():
             badge = "Unread" if not n.get("is_read") else "Read"
             render_card(safe_text(n.get("title")), str(n.get("created_at")), [badge, n.get("entity_type") or "General"], safe_text(n.get("body"), ""))
-            if not n.get("is_read") and st.button("Mark read", key=f"notif_{n['id']}"):
+
+            action_cols = st.columns([1, 1, 4])
+            if not n.get("is_read") and action_cols[0].button("Mark read", key=f"notif_{n['id']}"):
                 execute("UPDATE notifications SET is_read=TRUE WHERE id=:id AND recipient_user_id=:uid", {"id": int(n["id"]), "uid": actor_id})
                 st.rerun()
+
+            if n.get("entity_type") == "direct_messages" and n.get("entity_id"):
+                message = fetch_one("""
+                    SELECT m.*, u.display_name AS sender_name, u.email AS sender_email
+                    FROM direct_messages m
+                    JOIN users u ON u.id=m.sender_user_id
+                    WHERE m.id=:mid AND m.recipient_user_id=:uid
+                """, {"mid": int(n["entity_id"]), "uid": actor_id})
+                if message:
+                    with st.expander("Open message and reply"):
+                        st.markdown(f"**From:** {safe_text(message.get('sender_name'))}  \n**Subject:** {safe_text(message.get('subject'), 'No subject')}  \n**Sent:** {message.get('created_at')}")
+                        st.write(safe_text(message.get("body"), ""))
+                        execute("UPDATE direct_messages SET is_read=TRUE WHERE id=:id AND recipient_user_id=:uid", {"id": int(message["id"]), "uid": actor_id})
+                        execute("UPDATE notifications SET is_read=TRUE WHERE id=:id AND recipient_user_id=:uid", {"id": int(n["id"]), "uid": actor_id})
+                        with st.form(f"notification_reply_{n['id']}"):
+                            reply_text = st.text_area("Reply", placeholder="Write a response...")
+                            if st.form_submit_button("Send reply", type="primary"):
+                                if not reply_text.strip():
+                                    st.error("Reply cannot be empty.")
+                                else:
+                                    recipient_name = safe_text(message.get("sender_name"), "Unknown user")
+                                    reply_id = insert_record(
+                                        "direct_messages",
+                                        {
+                                            "sender_user_id": actor_id,
+                                            "recipient_user_id": int(message["sender_user_id"]),
+                                            "subject": f"Re: {message.get('subject') or 'Message'}",
+                                            "body": reply_text.strip(),
+                                            "parent_message_id": int(message["id"]),
+                                        },
+                                        actor,
+                                        f"Reply sent to {recipient_name}",
+                                    )
+                                    create_notification(
+                                        int(message["sender_user_id"]),
+                                        f"Reply from {actor}",
+                                        reply_text.strip()[:100],
+                                        "direct_messages",
+                                        reply_id,
+                                        actor_id,
+                                        "Messages",
+                                    )
+                                    st.success("Reply sent.")
+                                    st.rerun()
 
 # -----------------------------
 # Messages
@@ -1687,7 +1766,14 @@ elif page == "Messages":
                     st.error("Message cannot be empty.")
                 else:
                     recipient_id = users[recipient_label]
-                    msg_id = insert_record("direct_messages", {"sender_user_id": actor_id, "recipient_user_id": recipient_id, "subject": subject.strip(), "body": body.strip()}, actor, f"Direct message sent to user {recipient_id}")
+                    recipient = user_by_id(recipient_id) or {}
+                    recipient_name = recipient.get("display_name") or recipient.get("email") or "Unknown user"
+                    msg_id = insert_record(
+                        "direct_messages",
+                        {"sender_user_id": actor_id, "recipient_user_id": recipient_id, "subject": subject.strip(), "body": body.strip()},
+                        actor,
+                        f"Direct message sent to {recipient_name}",
+                    )
                     create_notification(recipient_id, f"New message from {actor}", subject.strip() or body.strip()[:80], "direct_messages", msg_id, actor_id, "Messages")
                     st.success("Message sent.")
                     st.rerun()
@@ -1702,7 +1788,13 @@ elif page == "Messages":
                 with st.form(f"reply_{m['id']}"):
                     reply = st.text_area("Reply")
                     if st.form_submit_button("Send reply") and reply.strip():
-                        reply_id = insert_record("direct_messages", {"sender_user_id": actor_id, "recipient_user_id": int(m["sender_user_id"]), "subject": f"Re: {m.get('subject') or 'Message'}", "body": reply.strip(), "parent_message_id": int(m["id"])}, actor, f"Reply sent to user {m['sender_user_id']}")
+                        sender_name = safe_text(m.get("sender_name"), "Unknown user")
+                        reply_id = insert_record(
+                            "direct_messages",
+                            {"sender_user_id": actor_id, "recipient_user_id": int(m["sender_user_id"]), "subject": f"Re: {m.get('subject') or 'Message'}", "body": reply.strip(), "parent_message_id": int(m["id"])},
+                            actor,
+                            f"Reply sent to {sender_name}",
+                        )
                         create_notification(int(m["sender_user_id"]), f"Reply from {actor}", reply.strip()[:100], "direct_messages", reply_id, actor_id, "Messages")
                         st.rerun()
     with sent:
@@ -1816,10 +1908,25 @@ elif page == "Activity":
     st.markdown("### Audit trail")
     entity=st.text_input("Filter entity type")
     actor_filter=st.text_input("Filter person")
-    sql="SELECT * FROM activity_log WHERE 1=1"; params={}
-    if entity: sql+=" AND entity_type ILIKE :e"; params["e"]=f"%{entity}%"
-    if actor_filter: sql+=" AND performed_by ILIKE :a"; params["a"]=f"%{actor_filter}%"
-    sql+=" ORDER BY created_at DESC LIMIT 500"
+    sql="""
+        SELECT a.id, a.created_at, a.action, a.entity_type,
+               CASE
+                 WHEN a.entity_type='direct_messages' AND dm.id IS NOT NULL THEN
+                   'Direct message from ' || COALESCE(sender.display_name, sender.email, 'Unknown user') ||
+                   ' to ' || COALESCE(recipient.display_name, recipient.email, 'Unknown user') ||
+                   CASE WHEN COALESCE(dm.subject, '') <> '' THEN ': ' || dm.subject ELSE '' END
+                 ELSE a.description
+               END AS description,
+               a.performed_by
+        FROM activity_log a
+        LEFT JOIN direct_messages dm ON a.entity_type='direct_messages' AND dm.id=a.entity_id
+        LEFT JOIN users sender ON sender.id=dm.sender_user_id
+        LEFT JOIN users recipient ON recipient.id=dm.recipient_user_id
+        WHERE 1=1
+    """; params={}
+    if entity: sql+=" AND a.entity_type ILIKE :e"; params["e"]=f"%{entity}%"
+    if actor_filter: sql+=" AND a.performed_by ILIKE :a"; params["a"]=f"%{actor_filter}%"
+    sql+=" ORDER BY a.created_at DESC LIMIT 500"
     st.dataframe(query_df(sql,params),use_container_width=True,hide_index=True)
 
 # -----------------------------
@@ -1829,8 +1936,7 @@ elif page == "Administration":
     if current_user["role"] != "Administrator":
         st.error("Administrator access is required.")
         st.stop()
-    st.markdown("### Administration and migration safety")
-    st.warning("All schema changes in this version are additive. Existing populated records are preserved; no table is dropped, truncated, or cleared.")
+    st.markdown("### Administration")
 
     users_tab, admins_tab, data_tab = st.tabs(["User approvals", "Administrators", "Data safety"])
     with users_tab:
