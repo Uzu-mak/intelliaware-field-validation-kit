@@ -197,6 +197,30 @@ def insert_record(table: str, values: dict, actor: str, description: str) -> int
         return new_id
 
 
+def insert_private_message(values: dict) -> int:
+    """Insert a private direct message without exposing it in the shared activity feed."""
+    values = {k: clean(v) for k, v in values.items()}
+    cols = list(values)
+    sql = f"INSERT INTO direct_messages ({', '.join(cols)}) VALUES ({', '.join(':'+c for c in cols)}) RETURNING id"
+    with get_engine().begin() as conn:
+        return int(conn.execute(text(sql), values).scalar_one())
+
+
+def insert_team_message(values: dict, actor: str) -> int:
+    """Insert a team-visible message and record an activity visible only to active team members."""
+    values = {k: clean(v) for k, v in values.items()}
+    cols = list(values)
+    sql = f"INSERT INTO team_messages ({', '.join(cols)}) VALUES ({', '.join(':'+c for c in cols)}) RETURNING id"
+    with get_engine().begin() as conn:
+        message_id = int(conn.execute(text(sql), values).scalar_one())
+        team = conn.execute(text("SELECT name FROM teams WHERE id=:id"), {"id": values["team_id"]}).mappings().first()
+        description = f"Team message posted in {(team or {}).get('name', 'team')}"
+        if values.get("subject"):
+            description += f": {values['subject']}"
+        log_activity(conn, "team_messages", message_id, "create", description, actor, {"team_id": {"old": None, "new": values["team_id"]}})
+        return message_id
+
+
 def update_record(table: str, record_id: int, values: dict, actor: str, description: str):
     values = {k: clean(v) for k, v in values.items()}
     current = fetch_one(f"SELECT * FROM {table} WHERE id=:id", {"id": record_id})
@@ -366,6 +390,26 @@ def init_schema():
     );
     CREATE INDEX IF NOT EXISTS idx_messages_recipient ON direct_messages(recipient_user_id, is_read, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_messages_sender ON direct_messages(sender_user_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS team_messages (
+        id BIGSERIAL PRIMARY KEY,
+        team_id BIGINT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+        sender_user_id BIGINT NOT NULL REFERENCES users(id),
+        subject TEXT,
+        body TEXT NOT NULL,
+        parent_message_id BIGINT REFERENCES team_messages(id),
+        edited_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_team_messages_team ON team_messages(team_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS team_message_reads (
+        team_message_id BIGINT NOT NULL REFERENCES team_messages(id) ON DELETE CASCADE,
+        user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        read_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY(team_message_id, user_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_team_message_reads_user ON team_message_reads(user_id, read_at DESC);
     """
     execute(sql)
 
@@ -553,6 +597,40 @@ def notify_team_leads(team_id: int | None, title: str, body: str, entity_type: s
         create_notification(int(row["id"]), title, body, entity_type, entity_id, sender_user_id, "My Work")
 
 
+def user_team_options(user_id: int):
+    current = st.session_state.get("current_user") or {}
+    if current.get("role") == "Administrator":
+        df = query_df("""
+            SELECT t.id, t.name,
+                   COALESCE(tm.team_role, 'Administrator oversight') AS team_role
+            FROM teams t
+            LEFT JOIN team_memberships tm
+              ON tm.team_id=t.id AND tm.user_id=:uid AND tm.active=TRUE
+            WHERE t.status='Active'
+            ORDER BY t.name
+        """, {"uid": user_id})
+    else:
+        df = query_df("""
+            SELECT t.id, t.name, tm.team_role
+            FROM team_memberships tm
+            JOIN teams t ON t.id=tm.team_id
+            WHERE tm.user_id=:uid AND tm.active=TRUE AND t.status='Active'
+            ORDER BY t.name
+        """, {"uid": user_id})
+    return {f"{r['name']} · {r['team_role']}": int(r['id']) for _, r in df.iterrows()}
+
+
+def notify_team_members(team_id: int, title: str, body: str, entity_id: int, sender_user_id: int):
+    members = query_df("""
+        SELECT DISTINCT u.id
+        FROM team_memberships tm
+        JOIN users u ON u.id=tm.user_id
+        WHERE tm.team_id=:tid AND tm.active=TRUE AND u.active=TRUE AND u.id<>:sender
+    """, {"tid": team_id, "sender": sender_user_id})
+    for _, row in members.iterrows():
+        create_notification(int(row["id"]), title, body, "team_messages", entity_id, sender_user_id, "Messages")
+
+
 def parse_optional_date(value):
     if value is None or value == "":
         return None
@@ -660,7 +738,7 @@ NAV_ITEMS = {
     "Reports": ("▧", "Generate project, trial, issue and readiness summaries."),
     "Activity": ("◷", "Review the cross-system audit trail and record revisions."),
     "Notifications": ("●", "Review account, task, team and workflow alerts."),
-    "Messages": ("✉", "Send and receive direct messages with registered users."),
+    "Messages": ("✉", "Send private messages and communicate in team channels."),
     "Administration": ("⚙", "Manage users, roles, migrations and administrative data views."),
 }
 
@@ -1073,9 +1151,15 @@ if page == "Dashboard":
             LEFT JOIN direct_messages dm ON a.entity_type='direct_messages' AND dm.id=a.entity_id
             LEFT JOIN users sender ON sender.id=dm.sender_user_id
             LEFT JOIN users recipient ON recipient.id=dm.recipient_user_id
+            LEFT JOIN team_messages tmsg ON a.entity_type='team_messages' AND tmsg.id=a.entity_id
+            WHERE a.entity_type <> 'direct_messages'
+              AND (a.entity_type <> 'team_messages' OR :activity_is_admin OR EXISTS (
+                    SELECT 1 FROM team_memberships tm
+                    WHERE tm.team_id=tmsg.team_id AND tm.user_id=:activity_user_id AND tm.active=TRUE
+              ))
             ORDER BY a.created_at DESC
             LIMIT 12
-        """)
+        """, {"activity_user_id": actor_id, "activity_is_admin": current_user["role"] == "Administrator"})
         if activity.empty: st.caption("No activity recorded.")
         for _, r in activity.iterrows():
             st.markdown(f"**{safe_text(r['action']).title()}** · {safe_text(r['entity_type'])}  \n{safe_text(r.get('display_description'), '')}  \n<span class='muted'>{r['created_at']} · {safe_text(r.get('performed_by'), 'System')}</span>", unsafe_allow_html=True)
@@ -1755,18 +1839,13 @@ elif page == "Notifications":
                                     st.error("Reply cannot be empty.")
                                 else:
                                     recipient_name = safe_text(message.get("sender_name"), "Unknown user")
-                                    reply_id = insert_record(
-                                        "direct_messages",
-                                        {
-                                            "sender_user_id": actor_id,
-                                            "recipient_user_id": int(message["sender_user_id"]),
-                                            "subject": f"Re: {message.get('subject') or 'Message'}",
-                                            "body": reply_text.strip(),
-                                            "parent_message_id": int(message["id"]),
-                                        },
-                                        actor,
-                                        f"Reply sent to {recipient_name}",
-                                    )
+                                    reply_id = insert_private_message({
+                                        "sender_user_id": actor_id,
+                                        "recipient_user_id": int(message["sender_user_id"]),
+                                        "subject": f"Re: {message.get('subject') or 'Message'}",
+                                        "body": reply_text.strip(),
+                                        "parent_message_id": int(message["id"]),
+                                    })
                                     create_notification(
                                         int(message["sender_user_id"]),
                                         f"Reply from {actor}",
@@ -1784,9 +1863,9 @@ elif page == "Notifications":
 # Messages
 # -----------------------------
 elif page == "Messages":
-    st.markdown("### Direct messages")
+    st.markdown("### Messages")
     show_message_flash()
-    compose, inbox, sent = st.tabs(["Compose", "Inbox", "Sent"])
+    compose, inbox, sent, team_channels = st.tabs(["Compose direct", "Inbox", "Sent", "Team channels"])
     with compose:
         users = user_options()
         users = {label: uid for label, uid in users.items() if uid != actor_id}
@@ -1804,12 +1883,12 @@ elif page == "Messages":
                     recipient_id = users[recipient_label]
                     recipient = user_by_id(recipient_id) or {}
                     recipient_name = recipient.get("display_name") or recipient.get("email") or "Unknown user"
-                    msg_id = insert_record(
-                        "direct_messages",
-                        {"sender_user_id": actor_id, "recipient_user_id": recipient_id, "subject": subject.strip(), "body": body.strip()},
-                        actor,
-                        f"Direct message sent to {recipient_name}",
-                    )
+                    msg_id = insert_private_message({
+                        "sender_user_id": actor_id,
+                        "recipient_user_id": recipient_id,
+                        "subject": subject.strip(),
+                        "body": body.strip(),
+                    })
                     create_notification(recipient_id, f"New message from {actor}", subject.strip() or body.strip()[:80], "direct_messages", msg_id, actor_id, "Messages")
                     st.session_state["compose_message_version"] = compose_version + 1
                     set_message_flash(f"Message sent successfully and delivered to {recipient_name}'s inbox.")
@@ -1831,12 +1910,13 @@ elif page == "Messages":
                             st.error("Reply cannot be empty.")
                         else:
                             sender_name = safe_text(m.get("sender_name"), "Unknown user")
-                            reply_id = insert_record(
-                                "direct_messages",
-                                {"sender_user_id": actor_id, "recipient_user_id": int(m["sender_user_id"]), "subject": f"Re: {m.get('subject') or 'Message'}", "body": reply.strip(), "parent_message_id": int(m["id"])},
-                                actor,
-                                f"Reply sent to {sender_name}",
-                            )
+                            reply_id = insert_private_message({
+                                "sender_user_id": actor_id,
+                                "recipient_user_id": int(m["sender_user_id"]),
+                                "subject": f"Re: {m.get('subject') or 'Message'}",
+                                "body": reply.strip(),
+                                "parent_message_id": int(m["id"]),
+                            })
                             create_notification(int(m["sender_user_id"]), f"Reply from {actor}", reply.strip()[:100], "direct_messages", reply_id, actor_id, "Messages")
                             st.session_state[inbox_reply_version_key] = inbox_reply_version + 1
                             set_message_flash(f"Reply sent successfully and delivered to {sender_name}'s inbox.")
@@ -1883,6 +1963,124 @@ elif page == "Messages":
                                 st.rerun()
             else:
                 st.caption("Editing period expired. Messages can be edited for 24 hours after sending.")
+    with team_channels:
+        team_map = user_team_options(actor_id)
+        if not team_map:
+            st.info("No active team channels are available.")
+        else:
+            team_label = st.selectbox("Team channel", list(team_map), key="team_channel_selector")
+            selected_team_id = team_map[team_label]
+            selected_team = fetch_one("SELECT id,name FROM teams WHERE id=:id", {"id": selected_team_id}) or {}
+            if current_user["role"] == "Administrator" and not user_leads_team(actor_id, selected_team_id):
+                st.caption(f"Administrator oversight view for {selected_team.get('name', 'this team')}. Active team members can also view this channel.")
+            else:
+                st.caption(f"Visible to active members of {selected_team.get('name', 'this team')} and administrators.")
+
+            channel_version = int(st.session_state.get(f"team_channel_compose_version_{selected_team_id}", 0))
+            with st.form(f"team_channel_compose_{selected_team_id}_{channel_version}", clear_on_submit=True):
+                team_subject = st.text_input("Subject", key=f"team_subject_{selected_team_id}_{channel_version}")
+                team_body = st.text_area("Message", key=f"team_body_{selected_team_id}_{channel_version}")
+                if st.form_submit_button("Post to team", type="primary"):
+                    if not team_body.strip():
+                        st.error("Message cannot be empty.")
+                    else:
+                        team_message_id = insert_team_message({
+                            "team_id": selected_team_id,
+                            "sender_user_id": actor_id,
+                            "subject": team_subject.strip(),
+                            "body": team_body.strip(),
+                        }, actor)
+                        notify_team_members(
+                            selected_team_id,
+                            f"New team message in {selected_team.get('name', 'team')}",
+                            team_subject.strip() or team_body.strip()[:100],
+                            team_message_id,
+                            actor_id,
+                        )
+                        st.session_state[f"team_channel_compose_version_{selected_team_id}"] = channel_version + 1
+                        set_message_flash(f"Message posted to {selected_team.get('name', 'the team')}.")
+                        st.rerun()
+
+            channel_messages = query_df("""
+                SELECT m.*, u.display_name sender_name, u.email sender_email,
+                       EXISTS(SELECT 1 FROM team_message_reads r WHERE r.team_message_id=m.id AND r.user_id=:uid) AS read_by_me,
+                       (SELECT COUNT(*) FROM team_message_reads r WHERE r.team_message_id=m.id) AS read_count,
+                       (SELECT COUNT(*) FROM team_memberships tm JOIN users ux ON ux.id=tm.user_id
+                        WHERE tm.team_id=m.team_id AND tm.active=TRUE AND ux.active=TRUE) AS member_count
+                FROM team_messages m
+                JOIN users u ON u.id=m.sender_user_id
+                WHERE m.team_id=:tid
+                ORDER BY m.created_at DESC
+            """, {"uid": actor_id, "tid": selected_team_id})
+            if channel_messages.empty:
+                st.caption("No messages have been posted to this team channel.")
+            for _, m in channel_messages.iterrows():
+                if not m.get("read_by_me"):
+                    execute("""
+                        INSERT INTO team_message_reads(team_message_id,user_id) VALUES(:mid,:uid)
+                        ON CONFLICT(team_message_id,user_id) DO NOTHING
+                    """, {"mid": int(m["id"]), "uid": actor_id})
+                badges = [f"Seen by {int(m.get('read_count') or 0)} of {int(m.get('member_count') or 0)}"]
+                if m.get("edited_at"):
+                    badges.append("Edited")
+                render_card(
+                    safe_text(m.get("subject"), "Team update"),
+                    f"{safe_text(m.get('sender_name'), 'Unknown user')} · {m.get('created_at')}" + (f" · Edited {m.get('edited_at')}" if m.get("edited_at") else ""),
+                    badges,
+                    safe_text(m.get("body"), ""),
+                )
+                with st.expander("Reply in channel"):
+                    team_reply_version_key = f"team_reply_version_{m['id']}"
+                    team_reply_version = int(st.session_state.get(team_reply_version_key, 0))
+                    with st.form(f"team_reply_{m['id']}_{team_reply_version}", clear_on_submit=True):
+                        team_reply = st.text_area("Reply", key=f"team_reply_text_{m['id']}_{team_reply_version}")
+                        if st.form_submit_button("Post reply", type="primary"):
+                            if not team_reply.strip():
+                                st.error("Reply cannot be empty.")
+                            else:
+                                reply_id = insert_team_message({
+                                    "team_id": selected_team_id,
+                                    "sender_user_id": actor_id,
+                                    "subject": f"Re: {m.get('subject') or 'Team update'}",
+                                    "body": team_reply.strip(),
+                                    "parent_message_id": int(m["id"]),
+                                }, actor)
+                                notify_team_members(
+                                    selected_team_id,
+                                    f"Reply in {selected_team.get('name', 'team')}",
+                                    team_reply.strip()[:100],
+                                    reply_id,
+                                    actor_id,
+                                )
+                                st.session_state[team_reply_version_key] = team_reply_version + 1
+                                set_message_flash(f"Reply posted to {selected_team.get('name', 'the team')}.")
+                                st.rerun()
+                if int(m.get("sender_user_id")) == actor_id and message_editable(m.get("created_at")):
+                    with st.expander("Edit team message (available for 24 hours)"):
+                        with st.form(f"edit_team_message_{m['id']}"):
+                            edited_subject = st.text_input("Subject", value=m.get("subject") or "", key=f"edit_team_subject_{m['id']}")
+                            edited_body = st.text_area("Message", value=m.get("body") or "", key=f"edit_team_body_{m['id']}")
+                            if st.form_submit_button("Save team message", type="primary"):
+                                if not edited_body.strip():
+                                    st.error("Message cannot be empty.")
+                                else:
+                                    update_record(
+                                        "team_messages",
+                                        int(m["id"]),
+                                        {"subject": edited_subject.strip(), "body": edited_body.strip(), "edited_at": datetime.now(timezone.utc)},
+                                        actor,
+                                        f"Team message in {selected_team.get('name', 'team')} edited",
+                                    )
+                                    notify_team_members(
+                                        selected_team_id,
+                                        f"Team message edited in {selected_team.get('name', 'team')}",
+                                        edited_subject.strip() or edited_body.strip()[:100],
+                                        int(m["id"]),
+                                        actor_id,
+                                    )
+                                    set_message_flash("Team message updated successfully.")
+                                    st.rerun()
+
 
 # -----------------------------
 # Analytics & readiness
@@ -2003,8 +2201,13 @@ elif page == "Activity":
         LEFT JOIN direct_messages dm ON a.entity_type='direct_messages' AND dm.id=a.entity_id
         LEFT JOIN users sender ON sender.id=dm.sender_user_id
         LEFT JOIN users recipient ON recipient.id=dm.recipient_user_id
-        WHERE 1=1
-    """; params={}
+        LEFT JOIN team_messages tmsg ON a.entity_type='team_messages' AND tmsg.id=a.entity_id
+        WHERE a.entity_type <> 'direct_messages'
+          AND (a.entity_type <> 'team_messages' OR :activity_is_admin OR EXISTS (
+                SELECT 1 FROM team_memberships tm
+                WHERE tm.team_id=tmsg.team_id AND tm.user_id=:activity_user_id AND tm.active=TRUE
+          ))
+    """; params={"activity_user_id": actor_id, "activity_is_admin": current_user["role"] == "Administrator"}
     if entity: sql+=" AND a.entity_type ILIKE :e"; params["e"]=f"%{entity}%"
     if actor_filter: sql+=" AND a.performed_by ILIKE :a"; params["a"]=f"%{actor_filter}%"
     sql+=" ORDER BY a.created_at DESC LIMIT 500"
@@ -2087,7 +2290,7 @@ elif page == "Administration":
                         st.rerun()
 
     with data_tab:
-        tables = ["project_status", "outreach_contacts", "trials", "ground_truth_logs", "issue_logs", "ux_test_logs", "readiness_handoffs", "projects", "teams", "team_memberships", "workstreams", "tasks", "evidence_items", "activity_log", "users", "app_sessions", "project_memberships", "notifications", "direct_messages"]
+        tables = ["project_status", "outreach_contacts", "trials", "ground_truth_logs", "issue_logs", "ux_test_logs", "readiness_handoffs", "projects", "teams", "team_memberships", "workstreams", "tasks", "evidence_items", "activity_log", "users", "app_sessions", "project_memberships", "notifications", "direct_messages", "team_messages", "team_message_reads"]
         counts = []
         for table in tables:
             if table_exists(table):
@@ -2111,4 +2314,4 @@ elif page == "Administration":
         st.dataframe(query_df(f"SELECT * FROM {selected} ORDER BY id"), use_container_width=True, hide_index=True)
 
 st.divider()
-st.caption("IntelliAware ValidationOps v7 — additive team membership, full workflow editing, approvals, notifications and messaging.")
+st.caption("IntelliAware ValidationOps v7.5 — private direct messaging, team channels, approvals and workflow traceability.")
