@@ -335,6 +335,35 @@ def init_schema():
         entity_type TEXT, entity_id INTEGER, is_read BOOLEAN DEFAULT FALSE,
         created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
     );
+
+    CREATE TABLE IF NOT EXISTS team_memberships (
+        id BIGSERIAL PRIMARY KEY,
+        team_id BIGINT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+        user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        team_role TEXT NOT NULL DEFAULT 'Member',
+        active BOOLEAN NOT NULL DEFAULT TRUE,
+        added_by_user_id BIGINT REFERENCES users(id),
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(team_id, user_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_team_memberships_team ON team_memberships(team_id, active);
+    CREATE INDEX IF NOT EXISTS idx_team_memberships_user ON team_memberships(user_id, active);
+
+    CREATE TABLE IF NOT EXISTS direct_messages (
+        id BIGSERIAL PRIMARY KEY,
+        sender_user_id BIGINT NOT NULL REFERENCES users(id),
+        recipient_user_id BIGINT NOT NULL REFERENCES users(id),
+        subject TEXT,
+        body TEXT NOT NULL,
+        parent_message_id BIGINT REFERENCES direct_messages(id),
+        related_entity_type TEXT,
+        related_entity_id INTEGER,
+        is_read BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_messages_recipient ON direct_messages(recipient_user_id, is_read, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_messages_sender ON direct_messages(sender_user_id, created_at DESC);
     """
     execute(sql)
 
@@ -368,6 +397,13 @@ def init_schema():
     ALTER TABLE activity_log ADD COLUMN IF NOT EXISTS performed_by_user_id BIGINT REFERENCES users(id);
     ALTER TABLE record_revisions ADD COLUMN IF NOT EXISTS changed_by_user_id BIGINT REFERENCES users(id);
     ALTER TABLE users ADD COLUMN IF NOT EXISTS access_level TEXT NOT NULL DEFAULT 'Read';
+    ALTER TABLE teams ADD COLUMN IF NOT EXISTS lead_user_id BIGINT REFERENCES users(id);
+    ALTER TABLE trials ADD COLUMN IF NOT EXISTS team_id BIGINT REFERENCES teams(id);
+    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS team_id BIGINT REFERENCES teams(id);
+    ALTER TABLE outreach_contacts ADD COLUMN IF NOT EXISTS latest_touchpoint_date DATE;
+    ALTER TABLE notifications ADD COLUMN IF NOT EXISTS recipient_user_id BIGINT REFERENCES users(id) ON DELETE CASCADE;
+    ALTER TABLE notifications ADD COLUMN IF NOT EXISTS sender_user_id BIGINT REFERENCES users(id);
+    ALTER TABLE notifications ADD COLUMN IF NOT EXISTS link_page TEXT;
     """
     execute(alter_sql)
 
@@ -381,7 +417,7 @@ def table_exists(name: str) -> bool:
 # Utilities
 # -----------------------------
 def normalize_evidence_url(value: str | None) -> str | None:
-    """Return a safe HTTP(S) evidence URL, or None when the value is unusable."""
+    """Return a usable public HTTP(S) evidence URL, or None."""
     if value is None:
         return None
 
@@ -389,9 +425,16 @@ def normalize_evidence_url(value: str | None) -> str | None:
     if not url:
         return None
 
-    # Local file paths cannot be opened by users from Streamlit Cloud.
-    lowered = url.lower()
-    if lowered.startswith(("file://", "localhost", "127.0.0.1")) or \
+    lowered = url.lower().strip()
+    placeholder_values = {
+        "n/a", "na", "none", "null", "nil", "not applicable",
+        "not available", "unknown", "tbd", "-", "--"
+    }
+    if lowered in placeholder_values:
+        return None
+
+    # Local paths and local-only hosts cannot be opened by Streamlit Cloud users.
+    if lowered.startswith(("file://", "localhost", "127.0.0.1", "0.0.0.0")) or \
        (len(url) >= 3 and url[1:3] in {":\\", ":/"}):
         return None
 
@@ -399,10 +442,104 @@ def normalize_evidence_url(value: str | None) -> str | None:
         url = f"https://{url}"
 
     parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+    hostname = (parsed.hostname or "").strip().lower()
+
+    if parsed.scheme not in {"http", "https"} or not hostname:
+        return None
+
+    # Reject single-word hosts such as https://n/a or https://test.
+    # Public evidence links should use a real domain or a valid IP address.
+    is_ipv4 = False
+    try:
+        parts = hostname.split(".")
+        is_ipv4 = len(parts) == 4 and all(0 <= int(part) <= 255 for part in parts)
+    except ValueError:
+        is_ipv4 = False
+
+    if "." not in hostname and not is_ipv4:
+        return None
+
+    if hostname.endswith((".local", ".localhost")):
         return None
 
     return url
+
+
+def safe_text(value: Any, fallback: str = "—") -> str:
+    text_value = str(value or "").strip()
+    return html.escape(text_value) if text_value else fallback
+
+
+def create_notification(recipient_user_id: int | None, title: str, body: str, entity_type: str | None = None, entity_id: int | None = None, sender_user_id: int | None = None, link_page: str | None = None):
+    if not recipient_user_id:
+        return
+    execute("""
+        INSERT INTO notifications(recipient_user_id, recipient, title, body, entity_type, entity_id, sender_user_id, link_page)
+        SELECT :recipient_user_id, display_name, :title, :body, :entity_type, :entity_id, :sender_user_id, :link_page
+        FROM users WHERE id=:recipient_user_id
+    """, {
+        "recipient_user_id": recipient_user_id, "title": title, "body": body,
+        "entity_type": entity_type, "entity_id": entity_id,
+        "sender_user_id": sender_user_id, "link_page": link_page,
+    })
+
+
+def notify_active_administrators(title: str, body: str, entity_type: str | None = None, entity_id: int | None = None, sender_user_id: int | None = None):
+    admins = query_df("SELECT id FROM users WHERE role='Administrator' AND active=TRUE")
+    for _, row in admins.iterrows():
+        create_notification(int(row["id"]), title, body, entity_type, entity_id, sender_user_id, "Administration")
+
+
+def team_member_options(team_id: int | None, active_only: bool = True):
+    if not team_id:
+        return {}
+    active_clause = "AND tm.active=TRUE AND u.active=TRUE" if active_only else ""
+    df = query_df(f"""
+        SELECT u.id, u.display_name, u.email, tm.team_role, u.access_level
+        FROM team_memberships tm
+        JOIN users u ON u.id=tm.user_id
+        WHERE tm.team_id=:team_id {active_clause}
+        ORDER BY CASE WHEN tm.team_role='Team Lead' THEN 0 ELSE 1 END, u.display_name
+    """, {"team_id": team_id})
+    return {f"{r['display_name']} · {r['team_role']} · {r['email']} ({r['access_level']})": int(r['id']) for _, r in df.iterrows()}
+
+
+def user_leads_team(user_id: int, team_id: int | None = None) -> bool:
+    if not user_id:
+        return False
+    sql = "SELECT 1 FROM team_memberships WHERE user_id=:uid AND team_role='Team Lead' AND active=TRUE"
+    params = {"uid": user_id}
+    if team_id:
+        sql += " AND team_id=:tid"
+        params["tid"] = team_id
+    return bool(fetch_one(sql + " LIMIT 1", params))
+
+
+def can_manage_team(team_id: int | None) -> bool:
+    current = st.session_state.get("current_user") or {}
+    return current.get("role") == "Administrator" or (team_id is not None and user_leads_team(int(current.get("id") or 0), team_id))
+
+
+def notify_team_leads(team_id: int | None, title: str, body: str, entity_type: str | None = None, entity_id: int | None = None, sender_user_id: int | None = None):
+    if not team_id:
+        return
+    leads = query_df("""
+        SELECT DISTINCT u.id FROM team_memberships tm JOIN users u ON u.id=tm.user_id
+        WHERE tm.team_id=:tid AND tm.team_role='Team Lead' AND tm.active=TRUE AND u.active=TRUE
+    """, {"tid": team_id})
+    for _, row in leads.iterrows():
+        if sender_user_id and int(row["id"]) == int(sender_user_id):
+            continue
+        create_notification(int(row["id"]), title, body, entity_type, entity_id, sender_user_id, "My Work")
+
+
+def parse_optional_date(value):
+    if value is None or value == "":
+        return None
+    try:
+        return pd.to_datetime(value).date()
+    except Exception:
+        return None
 
 
 def status_class(value: str) -> str:
@@ -440,7 +577,15 @@ def comments_panel(entity_type: str, entity_id: int, actor: str, can_edit: bool)
         with st.form(f"comment_{entity_type}_{entity_id}", clear_on_submit=True):
             body = st.text_area("Add a comment", label_visibility="collapsed", placeholder="Add context, a decision, or a handoff note…")
             if st.form_submit_button("Post comment") and body.strip():
-                insert_record("comments", {"entity_type": entity_type, "entity_id": entity_id, "body": body, "author": actor, "author_user_id": (st.session_state.get("current_user") or {}).get("id")}, actor, "Comment added")
+                current = st.session_state.get("current_user") or {}
+                comment_id = insert_record("comments", {"entity_type": entity_type, "entity_id": entity_id, "body": body, "author": actor, "author_user_id": current.get("id")}, actor, "Comment added")
+                if entity_type == "tasks":
+                    task = fetch_one("SELECT id,title,assignee_user_id,team_id FROM tasks WHERE id=:id", {"id": entity_id})
+                    if task:
+                        assignee_id = task.get("assignee_user_id")
+                        if assignee_id and int(assignee_id) != int(current.get("id") or 0):
+                            create_notification(int(assignee_id), "New task comment", f"{actor} commented on '{task.get('title') or 'Task'}': {body.strip()[:180]}", "tasks", entity_id, current.get("id"), "My Work")
+                        notify_team_leads(int(task["team_id"]) if task.get("team_id") else None, "New task comment", f"{actor} commented on '{task.get('title') or 'Task'}': {body.strip()[:180]}", "tasks", entity_id, current.get("id"))
                 st.rerun()
 
 
@@ -494,6 +639,8 @@ NAV_ITEMS = {
     "Analytics & Readiness": ("⌁", "Compare baselines, validation results and readiness gates."),
     "Reports": ("▧", "Generate project, trial, issue and readiness summaries."),
     "Activity": ("◷", "Review the cross-system audit trail and record revisions."),
+    "Notifications": ("●", "Review account, task, team and workflow alerts."),
+    "Messages": ("✉", "Send and receive direct messages with registered users."),
     "Administration": ("⚙", "Manage users, roles, migrations and administrative data views."),
 }
 
@@ -739,6 +886,11 @@ if not current_user:
                     VALUES (:email, :display_name, :password_hash, 'User', 'Read', TRUE)
                     RETURNING id, email, display_name, role, access_level
                 """, {"email": normalized_email, "display_name": new_name.strip(), "password_hash": ph.hash(new_password)})
+                notify_active_administrators(
+                    "New user registration",
+                    f"{user['display_name']} ({user['email']}) created an account with Read access and is awaiting review.",
+                    "users", int(user["id"]), int(user["id"]),
+                )
                 token = create_login_session(int(user["id"]))
                 _safe_cookie_set(cookies, SESSION_COOKIE, token, max_age=SESSION_ABSOLUTE_HOURS * 3600)
                 st.session_state.pending_session_token = token
@@ -779,6 +931,9 @@ with st.sidebar:
 
     st.divider()
     st.markdown('<div style="padding:.7rem .8rem;border-radius:10px;background:#DCFCE7;color:#166534;font-weight:700;">● Authenticated</div>', unsafe_allow_html=True)
+    unread_row = fetch_one("SELECT COUNT(*) AS n FROM notifications WHERE recipient_user_id=:uid AND is_read=FALSE", {"uid": actor_id})
+    unread_count = int(unread_row["n"] if unread_row else 0)
+    st.caption(f"Unread notifications: {unread_count}")
     st.caption(f"Session expires after {SESSION_IDLE_MINUTES} minutes of inactivity.")
     with st.popover("Account", use_container_width=True):
         st.write(f"**{current_user['display_name']}**")
@@ -962,108 +1117,242 @@ elif page == "Projects":
 # Workstreams + teams
 # -----------------------------
 elif page == "Workstreams":
-    project_map=project_options(); teams=team_options()
+    project_map = project_options()
+    active_teams = team_options()
     st.markdown("### Workstreams and teams")
-    top1,top2=st.tabs(["Workstreams","Teams"])
-    with top1:
-        if not project_map: st.info("Create a project first.")
+    work_tab, team_tab = st.tabs(["Workstreams", "Teams"])
+
+    with work_tab:
+        if not project_map:
+            st.info("Create a project first.")
         else:
-            selected_project=st.selectbox("Project", list(project_map)); pid=project_map[selected_project]
+            selected_project = st.selectbox("Project", list(project_map), key="ws_project")
+            pid = project_map[selected_project]
             if can_edit:
                 with st.expander("Add workstream"):
                     with st.form("add_workstream"):
-                        c1,c2=st.columns(2); name=c1.text_input("Name"); work_users=user_options(); owner_label=c2.selectbox("Owner", list(work_users)) if work_users else None; owner_user_id=work_users.get(owner_label) if owner_label else None; owner=(user_by_id(owner_user_id) or {}).get("display_name", "")
-                        team_name=c1.selectbox("Team", ["Unassigned"]+list(teams)); priority=c2.selectbox("Priority",["Low","Medium","High","Critical"],index=1)
-                        due=c1.date_input("Due date",value=None); description=st.text_area("Description"); deps=st.text_area("Dependencies / blockers")
-                        if st.form_submit_button("Create workstream") and name:
-                            insert_record("workstreams",{"project_id":pid,"name":name,"owner":owner,"owner_user_id":owner_user_id,"team_id":teams.get(team_name),"priority":priority,"due_date":due,"description":description,"dependency_notes":deps},actor,f"Workstream '{name}' created")
-                            st.rerun()
-            ws=query_df("SELECT w.*, t.name AS team_name FROM workstreams w LEFT JOIN teams t ON t.id=w.team_id WHERE w.project_id=:p ORDER BY w.id DESC",{"p":pid})
-            for _,r in ws.iterrows():
-                render_card(r["name"],f"Owner: {r.get('owner') or 'Unassigned'} · Team: {r.get('team_name') or 'Unassigned'}",[r.get("status"),r.get("priority"),f"{r.get('progress') or 0}%"],r.get("dependency_notes") or "")
-                if can_edit:
-                    with st.expander(f"Update {r['name']}"):
-                        with st.form(f"ws_{r['id']}"):
-                            status=st.selectbox("Status",["Backlog","Ready","In progress","Blocked","Under review","Completed"],key=f"wss{r['id']}")
-                            progress=st.slider("Progress",0,100,int(r.get("progress") or 0),key=f"wsp{r['id']}")
-                            owner=st.text_input("Owner",r.get("owner") or "",key=f"wso{r['id']}")
-                            if st.form_submit_button("Save"):
-                                update_record("workstreams",int(r["id"]),{"status":status,"progress":progress,"owner":owner,"updated_at":datetime.utcnow()},actor,f"Workstream '{r['name']}' updated")
+                        c1, c2 = st.columns(2)
+                        name = c1.text_input("Name")
+                        work_users = user_options()
+                        owner_label = c2.selectbox("Owner", ["Unassigned"] + list(work_users)) if work_users else None
+                        owner_user_id = work_users.get(owner_label) if owner_label else None
+                        owner = (user_by_id(owner_user_id) or {}).get("display_name", "")
+                        team_name = c1.selectbox("Team", ["Unassigned"] + list(active_teams))
+                        priority = c2.selectbox("Priority", ["Low", "Medium", "High", "Critical"], index=1)
+                        d1, d2 = st.columns(2)
+                        start_date = d1.date_input("Start date", value=None)
+                        due = d2.date_input("Due date", value=None)
+                        description = st.text_area("Description")
+                        deps = st.text_area("Dependencies / blockers")
+                        if st.form_submit_button("Create workstream", type="primary"):
+                            if not name.strip():
+                                st.error("Workstream name is required.")
+                            else:
+                                insert_record("workstreams", {"project_id": pid, "name": name.strip(), "owner": owner, "owner_user_id": owner_user_id, "team_id": active_teams.get(team_name), "priority": priority, "start_date": start_date, "due_date": due, "description": description, "dependency_notes": deps}, actor, f"Workstream '{name.strip()}' created")
                                 st.rerun()
-    with top2:
-        if can_edit:
+
+            ws = query_df("SELECT w.*, t.name AS team_name FROM workstreams w LEFT JOIN teams t ON t.id=w.team_id WHERE w.project_id=:p ORDER BY w.id DESC", {"p": pid})
+            for _, r in ws.iterrows():
+                render_card(safe_text(r.get("name"), "Unnamed workstream"), f"Owner: {safe_text(r.get('owner'), 'Unassigned')} · Team: {safe_text(r.get('team_name'), 'Unassigned')}", [r.get("status"), r.get("priority"), f"{r.get('progress') or 0}%"], safe_text(r.get("dependency_notes"), ""))
+                if can_edit:
+                    with st.expander(f"Edit {r['name']}"):
+                        with st.form(f"ws_{r['id']}"):
+                            c1, c2 = st.columns(2)
+                            edit_name = c1.text_input("Name", r.get("name") or "", key=f"wsn{r['id']}")
+                            work_users = user_options()
+                            owner_labels = ["Unassigned"] + list(work_users)
+                            current_owner_id = r.get("owner_user_id")
+                            current_owner_label = next((label for label, uid in work_users.items() if uid == current_owner_id), "Unassigned")
+                            owner_label = c2.selectbox("Owner", owner_labels, index=owner_labels.index(current_owner_label), key=f"wso{r['id']}")
+                            owner_user_id = work_users.get(owner_label)
+                            owner_name = (user_by_id(owner_user_id) or {}).get("display_name", "")
+                            all_team_df = query_df("SELECT id,name,status FROM teams ORDER BY name")
+                            team_map = {f"{row['name']} ({row['status']})": int(row['id']) for _, row in all_team_df.iterrows()}
+                            team_labels = ["Unassigned"] + list(team_map)
+                            current_team_label = next((label for label, tid in team_map.items() if tid == r.get("team_id")), "Unassigned")
+                            team_label = c1.selectbox("Team", team_labels, index=team_labels.index(current_team_label), key=f"wst{r['id']}")
+                            priority_opts = ["Low", "Medium", "High", "Critical"]
+                            priority = c2.selectbox("Priority", priority_opts, index=priority_opts.index(r.get("priority")) if r.get("priority") in priority_opts else 1, key=f"wsp{r['id']}")
+                            d1, d2 = st.columns(2)
+                            start_date = d1.date_input("Start date", value=parse_optional_date(r.get("start_date")), key=f"wssd{r['id']}")
+                            due_date = d2.date_input("Due date", value=parse_optional_date(r.get("due_date")), key=f"wsdd{r['id']}")
+                            status_opts = ["Backlog", "Ready", "In progress", "Blocked", "Under review", "Completed"]
+                            status = c1.selectbox("Status", status_opts, index=status_opts.index(r.get("status")) if r.get("status") in status_opts else 0, key=f"wss{r['id']}")
+                            progress = c2.slider("Progress", 0, 100, int(r.get("progress") or 0), key=f"wspr{r['id']}")
+                            description = st.text_area("Description", r.get("description") or "", key=f"wsdesc{r['id']}")
+                            deps = st.text_area("Dependencies / blockers", r.get("dependency_notes") or "", key=f"wsdep{r['id']}")
+                            if st.form_submit_button("Save workstream", type="primary"):
+                                if not edit_name.strip():
+                                    st.error("Workstream name is required.")
+                                else:
+                                    update_record("workstreams", int(r["id"]), {"name": edit_name.strip(), "owner": owner_name, "owner_user_id": owner_user_id, "team_id": team_map.get(team_label), "priority": priority, "start_date": start_date, "due_date": due_date, "status": status, "progress": progress, "description": description, "dependency_notes": deps, "updated_at": datetime.utcnow()}, actor, f"Workstream '{edit_name.strip()}' updated")
+                                    st.rerun()
+
+    with team_tab:
+        can_create_team = current_user["role"] == "Administrator" or user_leads_team(actor_id)
+        if can_create_team:
             with st.expander("Create team"):
                 with st.form("create_team"):
-                    name=st.text_input("Team name"); lead=st.text_input("Team lead"); purpose=st.text_area("Purpose")
-                    if st.form_submit_button("Create team") and name:
-                        insert_record("teams",{"name":name,"lead_name":lead,"purpose":purpose},actor,f"Team '{name}' created"); st.rerun()
-        team_df=query_df("SELECT * FROM teams ORDER BY name")
-        for _,r in team_df.iterrows(): render_card(r["name"],f"Lead: {r.get('lead_name') or 'Unassigned'}",[r.get("status")],r.get("purpose") or "")
+                    name = st.text_input("Team name")
+                    purpose = st.text_area("Purpose")
+                    registered = user_options()
+                    lead_label = st.selectbox("Team lead", ["Unassigned"] + list(registered)) if registered else None
+                    lead_user_id = registered.get(lead_label) if lead_label else None
+                    if st.form_submit_button("Create team", type="primary"):
+                        if not name.strip():
+                            st.error("Team name is required.")
+                        else:
+                            lead_user = user_by_id(lead_user_id) or {}
+                            team_id = insert_record("teams", {"name": name.strip(), "lead_name": lead_user.get("display_name"), "lead_user_id": lead_user_id, "purpose": purpose, "status": "Active"}, actor, f"Team '{name.strip()}' created")
+                            if lead_user_id:
+                                execute("INSERT INTO team_memberships(team_id,user_id,team_role,active,added_by_user_id) VALUES(:t,:u,'Team Lead',TRUE,:a) ON CONFLICT(team_id,user_id) DO UPDATE SET team_role='Team Lead',active=TRUE,updated_at=CURRENT_TIMESTAMP", {"t": team_id, "u": lead_user_id, "a": actor_id})
+                                create_notification(lead_user_id, "Team lead assignment", f"You were assigned as Team Lead for {name.strip()}.", "teams", team_id, actor_id, "Workstreams")
+                            st.rerun()
+
+        team_df = query_df("SELECT t.*,u.display_name AS lead_display_name FROM teams t LEFT JOIN users u ON u.id=t.lead_user_id ORDER BY t.name")
+        for _, team in team_df.iterrows():
+            team_id = int(team["id"])
+            lead_name = team.get("lead_display_name") or team.get("lead_name") or "Unassigned"
+            member_count = fetch_one("SELECT COUNT(*) AS n FROM team_memberships WHERE team_id=:t AND active=TRUE", {"t": team_id})
+            render_card(safe_text(team.get("name")), f"Lead: {safe_text(lead_name)}", [team.get("status"), f"{int(member_count['n'] if member_count else 0)} active members"], safe_text(team.get("purpose"), ""))
+            with st.expander(f"Manage {team['name']}"):
+                members = query_df("""
+                    SELECT tm.id membership_id,tm.user_id,tm.team_role,tm.active,u.display_name,u.email,u.access_level
+                    FROM team_memberships tm JOIN users u ON u.id=tm.user_id
+                    WHERE tm.team_id=:t ORDER BY tm.active DESC, CASE WHEN tm.team_role='Team Lead' THEN 0 ELSE 1 END,u.display_name
+                """, {"t": team_id})
+                if members.empty:
+                    st.caption("No registered users have been added to this team.")
+                else:
+                    st.dataframe(members[["display_name", "email", "team_role", "access_level", "active"]], use_container_width=True, hide_index=True)
+
+                if can_manage_team(team_id):
+                    st.markdown("#### Add registered user")
+                    search = st.text_input("Search users by name or email", key=f"team_search_{team_id}")
+                    params = {"team": team_id}
+                    sql = """SELECT id,display_name,email,access_level FROM users WHERE active=TRUE AND id NOT IN (SELECT user_id FROM team_memberships WHERE team_id=:team AND active=TRUE)"""
+                    if search.strip():
+                        sql += " AND (display_name ILIKE :q OR email ILIKE :q)"
+                        params["q"] = f"%{search.strip()}%"
+                    sql += " ORDER BY display_name LIMIT 50"
+                    candidates = query_df(sql, params)
+                    candidate_map = {f"{r['display_name']} · {r['email']} ({r['access_level']})": int(r['id']) for _, r in candidates.iterrows()}
+                    with st.form(f"add_member_{team_id}"):
+                        member_label = st.selectbox("User", list(candidate_map) if candidate_map else ["No matching users"], key=f"member_select_{team_id}")
+                        member_role = st.selectbox("Team role", ["Member", "Developer", "Validation Engineer", "Reviewer", "Team Lead"], key=f"member_role_{team_id}")
+                        add_member = st.form_submit_button("Add to team")
+                    if add_member and candidate_map and member_label in candidate_map:
+                        uid = candidate_map[member_label]
+                        execute("INSERT INTO team_memberships(team_id,user_id,team_role,active,added_by_user_id) VALUES(:t,:u,:r,TRUE,:a) ON CONFLICT(team_id,user_id) DO UPDATE SET team_role=:r,active=TRUE,updated_at=CURRENT_TIMESTAMP", {"t": team_id, "u": uid, "r": member_role, "a": actor_id})
+                        if member_role == "Team Lead":
+                            lead_user = user_by_id(uid) or {}
+                            execute("UPDATE teams SET lead_user_id=:u,lead_name=:n WHERE id=:t", {"u": uid, "n": lead_user.get("display_name"), "t": team_id})
+                        create_notification(uid, "Team membership updated", f"You were added to {team['name']} as {member_role}.", "teams", team_id, actor_id, "Workstreams")
+                        st.rerun()
+
+                    if not members.empty:
+                        st.markdown("#### Update or remove member")
+                        member_map = {f"{r['display_name']} · {r['email']} ({r['team_role']})": int(r['membership_id']) for _, r in members.iterrows()}
+                        selected_member = st.selectbox("Team member", list(member_map), key=f"remove_member_{team_id}")
+                        membership = fetch_one("SELECT tm.*,u.display_name,u.id AS uid FROM team_memberships tm JOIN users u ON u.id=tm.user_id WHERE tm.id=:id", {"id": member_map[selected_member]})
+                        mc1, mc2 = st.columns(2)
+                        role_opts = ["Member", "Developer", "Validation Engineer", "Reviewer", "Team Lead"]
+                        new_role = mc1.selectbox("Member role", role_opts, index=role_opts.index(membership.get("team_role")) if membership.get("team_role") in role_opts else 0, key=f"change_role_{team_id}")
+                        active_member = mc2.checkbox("Membership active", value=bool(membership.get("active")), key=f"member_active_{team_id}")
+                        if st.button("Save membership", key=f"save_membership_{team_id}"):
+                            execute("UPDATE team_memberships SET team_role=:r,active=:active,updated_at=CURRENT_TIMESTAMP WHERE id=:id", {"r": new_role, "active": active_member, "id": membership["id"]})
+                            create_notification(int(membership["uid"]), "Team membership updated", f"Your membership in {team['name']} is now {new_role} ({'active' if active_member else 'inactive'}).", "teams", team_id, actor_id, "Workstreams")
+                            st.rerun()
+
+                    status_options = ["Active", "Inactive"]
+                    new_status = st.selectbox("Team status", status_options, index=status_options.index(team.get("status")) if team.get("status") in status_options else 0, key=f"team_status_{team_id}")
+                    if st.button("Save team status", key=f"save_team_status_{team_id}"):
+                        update_record("teams", team_id, {"status": new_status}, actor, f"Team '{team['name']}' changed to {new_status}")
+                        st.rerun()
 
 # -----------------------------
 # My Work / tasks
 # -----------------------------
 elif page == "My Work":
     project_map = project_options()
-    users = user_options()
     st.markdown("### My Work")
-    st.caption("Tasks are loaded automatically from your authenticated account. No name matching is used.")
+    st.caption("Tasks are linked to your authenticated account. Team-aware assignment limits assignees to active members of the selected workstream team.")
 
-    if has_permission("task.write") and project_map:
+    can_create_task = has_permission("task.write")
+    if can_create_task and project_map:
         with st.expander("Create task"):
-            with st.form("create_task"):
-                p_name = st.selectbox("Project", list(project_map)); pid = project_map[p_name]
-                ws_df = query_df("SELECT id,name FROM workstreams WHERE project_id=:p ORDER BY name", {"p": pid})
-                ws_map = {r['name']: int(r['id']) for _, r in ws_df.iterrows()}
-                c1, c2 = st.columns(2)
-                title = c1.text_input("Task title")
-                assignee_label = c2.selectbox("Assignee", list(users), index=list(users.values()).index(actor_id) if actor_id in users.values() else 0) if users else None
-                ws_name = c1.selectbox("Workstream", ["None"] + list(ws_map))
-                priority = c2.selectbox("Priority", ["Low", "Medium", "High", "Critical"], index=1)
-                due = c1.date_input("Due date", value=None)
-                description = st.text_area("Description")
-                criteria = st.text_area("Completion criteria")
-                if st.form_submit_button("Create task") and title and assignee_label:
-                    assignee_user_id = users[assignee_label]
-                    assignee_user = user_by_id(assignee_user_id)
-                    insert_record("tasks", {
-                        "project_id": pid,
-                        "workstream_id": ws_map.get(ws_name),
-                        "title": title,
-                        "assignee": assignee_user["display_name"],
-                        "assignee_user_id": assignee_user_id,
-                        "priority": priority,
-                        "due_date": due,
-                        "description": description,
-                        "completion_criteria": criteria,
-                    }, actor, f"Task '{title}' created and assigned to {assignee_user['display_name']}")
-                    st.rerun()
+            p_name = st.selectbox("Project", list(project_map), key="task_project")
+            pid = project_map[p_name]
+            ws_df = query_df("SELECT w.id,w.name,w.team_id,t.name team_name FROM workstreams w LEFT JOIN teams t ON t.id=w.team_id WHERE w.project_id=:p ORDER BY w.name", {"p": pid})
+            ws_map = {f"{r['name']} · {r.get('team_name') or 'No team'}": int(r['id']) for _, r in ws_df.iterrows()}
+            ws_label = st.selectbox("Workstream", list(ws_map) if ws_map else ["No workstreams available"], key="task_workstream")
+            selected_ws = fetch_one("SELECT * FROM workstreams WHERE id=:id", {"id": ws_map.get(ws_label)}) if ws_map and ws_label in ws_map else None
+            team_id = int(selected_ws["team_id"]) if selected_ws and selected_ws.get("team_id") else None
+            members = team_member_options(team_id)
+            if not team_id:
+                st.warning("Assign an active team to this workstream before creating a task.")
+            elif not members:
+                st.warning("The assigned team has no active registered members. Add users to the team first.")
+            else:
+                with st.form("create_task"):
+                    c1, c2 = st.columns(2)
+                    title = c1.text_input("Task title")
+                    assignee_label = c2.selectbox("Assignee", list(members))
+                    priority = c1.selectbox("Priority", ["Low", "Medium", "High", "Critical"], index=1)
+                    due = c2.date_input("Due date", value=None)
+                    description = st.text_area("Description")
+                    criteria = st.text_area("Completion criteria")
+                    if st.form_submit_button("Create task", type="primary"):
+                        if not title.strip():
+                            st.error("Task title is required.")
+                        else:
+                            assignee_user_id = members[assignee_label]
+                            assignee_user = user_by_id(assignee_user_id)
+                            task_id = insert_record("tasks", {"project_id": pid, "workstream_id": int(selected_ws["id"]), "team_id": team_id, "title": title.strip(), "assignee": assignee_user["display_name"], "assignee_user_id": assignee_user_id, "priority": priority, "due_date": due, "description": description, "completion_criteria": criteria}, actor, f"Task '{title.strip()}' created and assigned to {assignee_user['display_name']}")
+                            create_notification(assignee_user_id, "New task assigned", f"{actor} assigned you '{title.strip()}'.", "tasks", task_id, actor_id, "My Work")
+                            notify_team_leads(team_id, "Task assigned", f"{actor} assigned '{title.strip()}' to {assignee_user['display_name']}.", "tasks", task_id, actor_id)
+                            st.rerun()
 
-    tasks = query_df("""
-        SELECT tk.*, p.name project_name, w.name workstream_name
-        FROM tasks tk
-        LEFT JOIN projects p ON p.id=tk.project_id
-        LEFT JOIN workstreams w ON w.id=tk.workstream_id
-        WHERE tk.assignee_user_id=:uid
-        ORDER BY tk.due_date NULLS LAST, tk.id DESC
-    """, {"uid": actor_id})
+    mine_tab, team_tab = st.tabs(["My assigned tasks", "Team tasks"])
+    with mine_tab:
+        tasks = query_df("""
+            SELECT tk.*, p.name project_name, w.name workstream_name,te.name team_name
+            FROM tasks tk LEFT JOIN projects p ON p.id=tk.project_id
+            LEFT JOIN workstreams w ON w.id=tk.workstream_id LEFT JOIN teams te ON te.id=tk.team_id
+            WHERE tk.assignee_user_id=:uid ORDER BY tk.due_date NULLS LAST, tk.id DESC
+        """, {"uid": actor_id})
+        if tasks.empty:
+            st.info("No tasks are currently assigned to your account.")
+        for _, r in tasks.iterrows():
+            render_card(safe_text(r.get("title")), f"{safe_text(r.get('project_name'), 'No project')} · {safe_text(r.get('workstream_name'), 'No workstream')} · {safe_text(r.get('team_name'), 'No team')}", [r.get("status"), r.get("priority"), str(r.get("due_date") or "No due date")], safe_text(r.get("description"), ""))
+            with st.expander("Open task"):
+                st.write(f"**Completion criteria:** {r.get('completion_criteria') or 'Not defined'}")
+                if has_permission("task.write"):
+                    with st.form(f"task_{r['id']}"):
+                        status_opts = ["Backlog", "Ready", "In progress", "Blocked", "Under review", "Completed"]
+                        status = st.selectbox("Status", status_opts, index=status_opts.index(r.get("status")) if r.get("status") in status_opts else 0)
+                        note = st.text_area("Update note")
+                        if st.form_submit_button("Save update"):
+                            old_status = r.get("status")
+                            vals = {"status": status, "updated_at": datetime.utcnow()}
+                            if status == "Completed": vals["completed_at"] = datetime.utcnow()
+                            update_record("tasks", int(r["id"]), vals, actor, note or f"Task '{r['title']}' moved from {old_status} to {status}")
+                            notify_team_leads(int(r["team_id"]) if r.get("team_id") else None, "Task status changed", f"{actor} changed '{r['title']}' from {old_status} to {status}. {note}".strip(), "tasks", int(r["id"]), actor_id)
+                            st.rerun()
+                comments_panel("tasks", int(r["id"]), actor, True)
+                record_timeline("tasks", int(r["id"]))
 
-    if tasks.empty:
-        st.info("No tasks are currently assigned to your account.")
-    for _, r in tasks.iterrows():
-        due_text = str(r.get("due_date") or "No due date")
-        render_card(r["title"], f"{r.get('project_name') or 'No project'} · {r.get('workstream_name') or 'No workstream'}", [r.get("status"), r.get("priority"), due_text], r.get("description") or "")
-        if has_permission("task.write"):
-            with st.expander("Update task", expanded=False):
-                with st.form(f"task_{r['id']}"):
-                    status = st.selectbox("Status", ["Backlog", "Ready", "In progress", "Blocked", "Under review", "Completed"], index=["Backlog", "Ready", "In progress", "Blocked", "Under review", "Completed"].index(r.get("status")) if r.get("status") in ["Backlog", "Ready", "In progress", "Blocked", "Under review", "Completed"] else 0)
-                    note = st.text_area("Update note", key=f"tn{r['id']}")
-                    if st.form_submit_button("Save update"):
-                        vals = {"status": status, "updated_at": datetime.utcnow()}
-                        if status == "Completed":
-                            vals["completed_at"] = datetime.utcnow()
-                        update_record("tasks", int(r["id"]), vals, actor, note or f"Task '{r['title']}' updated")
-                        st.rerun()
+    with team_tab:
+        led = query_df("""SELECT t.id,t.name FROM teams t JOIN team_memberships tm ON tm.team_id=t.id WHERE tm.user_id=:uid AND tm.team_role='Team Lead' AND tm.active=TRUE ORDER BY t.name""", {"uid": actor_id})
+        if current_user["role"] == "Administrator":
+            led = query_df("SELECT id,name FROM teams ORDER BY name")
+        if led.empty:
+            st.caption("Team-task oversight is available to administrators and designated team leads.")
+        else:
+            led_map = {r["name"]: int(r["id"]) for _, r in led.iterrows()}
+            team_name = st.selectbox("Team", list(led_map), key="team_task_team")
+            team_tasks = query_df("""SELECT tk.*,u.display_name assignee_name,w.name workstream_name FROM tasks tk LEFT JOIN users u ON u.id=tk.assignee_user_id LEFT JOIN workstreams w ON w.id=tk.workstream_id WHERE tk.team_id=:t ORDER BY tk.updated_at DESC""", {"t": led_map[team_name]})
+            st.dataframe(team_tasks[[c for c in ["title","assignee_name","workstream_name","priority","status","due_date","updated_at"] if c in team_tasks]], use_container_width=True, hide_index=True)
 
 # -----------------------------
 # Milestones and risks
@@ -1114,115 +1403,145 @@ elif page == "Milestones & Risks":
 # -----------------------------
 elif page == "Trials":
     st.markdown("### Trial operations")
-    project_map=project_options()
+    project_map = project_options()
+    active_teams = team_options()
     if has_permission("trial.write"):
         with st.expander("Plan trial"):
             with st.form("create_trial"):
-                p_name=st.selectbox("Project",["Unassigned"]+list(project_map)); pid=project_map.get(p_name)
-                c1,c2=st.columns(2); name=c1.text_input("Trial name"); trial_users=user_options(); owner_label=c2.selectbox("Owner", list(trial_users), index=list(trial_users.values()).index(actor_id) if actor_id in trial_users.values() else 0) if trial_users else None; trial_owner_user_id=trial_users.get(owner_label) if owner_label else None; owner=(user_by_id(trial_owner_user_id) or {}).get("display_name", actor)
-                environment=c1.text_input("Environment / site"); process=c2.text_input("Process type")
-                planned=c1.date_input("Planned date",value=None); model=c2.text_input("Model/software version")
-                level=c1.selectbox("Validation level",["Simulated","Controlled lab","Shadow factory","Operational pilot","Production readiness"])
-                criteria=st.text_area("Success criteria"); notes=st.text_area("Notes")
-                if st.form_submit_button("Create trial") and name:
-                    insert_record("trials",{"trial_name":name,"project_id":pid,"environment":environment,"process_type":process,"trial_owner":owner,"trial_owner_user_id":trial_owner_user_id,"planned_date":planned,"status":"Draft","success_criteria":criteria,"notes":notes,"model_version":model,"validation_level":level},actor,f"Trial '{name}' created")
-                    st.rerun()
-    trials=query_df("SELECT tr.*,p.name project_name FROM trials tr LEFT JOIN projects p ON p.id=tr.project_id ORDER BY tr.id DESC")
-    for _,r in trials.iterrows():
-        render_card(r.get("trial_name") or f"Trial {r['id']}",f"{r.get('project_name') or 'Legacy/unassigned'} · Owner: {r.get('trial_owner') or 'Unassigned'}",[r.get("status"),r.get("validation_level") or "Legacy",r.get("model_version") or "Version not set"],r.get("success_criteria") or "")
+                p_name = st.selectbox("Project", ["Unassigned"] + list(project_map)); pid = project_map.get(p_name)
+                c1, c2 = st.columns(2)
+                name = c1.text_input("Trial name")
+                trial_users = user_options()
+                owner_label = c2.selectbox("Owner", ["Unassigned"] + list(trial_users)) if trial_users else None
+                trial_owner_user_id = trial_users.get(owner_label) if owner_label else None
+                owner = (user_by_id(trial_owner_user_id) or {}).get("display_name", "")
+                environment = c1.text_input("Environment / site")
+                process = c2.text_input("Process type")
+                planned = c1.date_input("Planned date", value=None)
+                model = c2.text_input("Model/software version")
+                team_label = c1.selectbox("Team", ["Unassigned"] + list(active_teams))
+                level = c2.selectbox("Validation level", ["Simulated", "Controlled lab", "Shadow factory", "Operational pilot", "Production readiness"])
+                ws_df = query_df("SELECT id,name FROM workstreams WHERE project_id=:p ORDER BY name", {"p": pid}) if pid else pd.DataFrame()
+                ws_map = {r["name"]: int(r["id"]) for _, r in ws_df.iterrows()}
+                ws_label = st.selectbox("Workstream", ["Unassigned"] + list(ws_map))
+                criteria = st.text_area("Success criteria")
+                notes = st.text_area("Notes")
+                if st.form_submit_button("Create trial", type="primary"):
+                    if not name.strip():
+                        st.error("Trial name is required.")
+                    else:
+                        insert_record("trials", {"trial_name": name.strip(), "project_id": pid, "workstream_id": ws_map.get(ws_label), "team_id": active_teams.get(team_label), "environment": environment, "process_type": process, "trial_owner": owner, "trial_owner_user_id": trial_owner_user_id, "planned_date": planned, "status": "Draft", "success_criteria": criteria, "notes": notes, "model_version": model, "validation_level": level}, actor, f"Trial '{name.strip()}' created")
+                        st.rerun()
+    trials = query_df("SELECT tr.*,p.name project_name,w.name workstream_name,t.name team_name FROM trials tr LEFT JOIN projects p ON p.id=tr.project_id LEFT JOIN workstreams w ON w.id=tr.workstream_id LEFT JOIN teams t ON t.id=tr.team_id ORDER BY tr.id DESC")
+    for _, r in trials.iterrows():
+        render_card(safe_text(r.get("trial_name"), f"Trial {r['id']}"), f"{safe_text(r.get('project_name'), 'Legacy/unassigned')} · {safe_text(r.get('workstream_name'), 'No workstream')} · Team: {safe_text(r.get('team_name'), 'Unassigned')}", [r.get("status"), r.get("validation_level") or "Legacy", r.get("model_version") or "Version not set"], safe_text(r.get("success_criteria"), ""))
         with st.expander("Open trial"):
-            c1,c2=st.columns([1,1])
-            with c1:
-                st.write(f"**Environment:** {r.get('environment') or '—'}")
-                st.write(f"**Process:** {r.get('process_type') or '—'}")
-                st.write(f"**Planned:** {r.get('planned_date') or '—'}")
-                st.write(f"**Notes:** {r.get('notes') or '—'}")
-            with c2:
-                gt=query_df("SELECT * FROM ground_truth_logs WHERE trial_id=:id OR (trial_id IS NULL AND run_id=:run)",{"id":int(r['id']),"run":r.get('trial_name')})
-                if not gt.empty:
-                    row=gt.iloc[-1]; obs=float(row.get("observed_cycle_count") or 0); fp=float(row.get("false_positives") or 0); fn=float(row.get("false_negatives") or 0); tp=max(obs-fn,0)
-                    precision=tp/(tp+fp) if tp+fp else 0; recall=tp/obs if obs else 0
-                    m=st.columns(3);m[0].metric("Precision",f"{precision:.1%}");m[1].metric("Recall",f"{recall:.1%}");m[2].metric("Mismatches",int(row.get("mismatch_count") or 0))
-                else: st.caption("No linked validation-run results yet.")
+            st.write(f"**Owner:** {r.get('trial_owner') or 'Unassigned'}")
+            st.write(f"**Environment:** {r.get('environment') or '—'}")
+            st.write(f"**Process:** {r.get('process_type') or '—'}")
+            st.write(f"**Planned:** {r.get('planned_date') or '—'}")
+            st.write(f"**Notes:** {r.get('notes') or '—'}")
             if has_permission("trial.write"):
                 with st.form(f"trial_update_{r['id']}"):
-                    status=st.selectbox("Status",["Draft","Planned","Approved","Setup in progress","Ready to run","Running","Evidence review","Analysis","Completed","Archived"],key=f"trs{r['id']}")
-                    note=st.text_area("Update note",key=f"trn{r['id']}")
-                    if st.form_submit_button("Update trial"):
-                        update_record("trials",int(r["id"]),{"status":status,"updated_at":datetime.utcnow()},actor,note or f"Trial status changed to {status}");st.rerun()
-            record_timeline("trials",int(r["id"]))
+                    c1, c2 = st.columns(2)
+                    edit_name = c1.text_input("Trial name", r.get("trial_name") or "")
+                    project_labels = ["Unassigned"] + list(project_map)
+                    current_project = next((label for label, val in project_map.items() if val == r.get("project_id")), "Unassigned")
+                    project_label = c2.selectbox("Project", project_labels, index=project_labels.index(current_project))
+                    edit_pid = project_map.get(project_label)
+                    edit_ws_df = query_df("SELECT id,name FROM workstreams WHERE project_id=:p ORDER BY name", {"p": edit_pid}) if edit_pid else pd.DataFrame()
+                    edit_ws_map = {row["name"]: int(row["id"]) for _, row in edit_ws_df.iterrows()}
+                    ws_labels = ["Unassigned"] + list(edit_ws_map)
+                    current_ws = next((label for label, val in edit_ws_map.items() if val == r.get("workstream_id")), "Unassigned")
+                    ws_label = c1.selectbox("Workstream", ws_labels, index=ws_labels.index(current_ws))
+                    all_team_df = query_df("SELECT id,name,status FROM teams ORDER BY name")
+                    team_map = {f"{row['name']} ({row['status']})": int(row['id']) for _, row in all_team_df.iterrows()}
+                    team_labels = ["Unassigned"] + list(team_map)
+                    current_team = next((label for label, val in team_map.items() if val == r.get("team_id")), "Unassigned")
+                    team_label = c2.selectbox("Team", team_labels, index=team_labels.index(current_team))
+                    users = user_options(); owner_labels = ["Unassigned"] + list(users)
+                    current_owner = next((label for label, val in users.items() if val == r.get("trial_owner_user_id")), "Unassigned")
+                    owner_label = c1.selectbox("Owner", owner_labels, index=owner_labels.index(current_owner))
+                    owner_uid = users.get(owner_label); owner_name = (user_by_id(owner_uid) or {}).get("display_name", "")
+                    environment = c2.text_input("Environment / site", r.get("environment") or "")
+                    process = c1.text_input("Process type", r.get("process_type") or "")
+                    planned = c2.date_input("Planned date", value=parse_optional_date(r.get("planned_date")))
+                    model = c1.text_input("Model/software version", r.get("model_version") or "")
+                    level_opts = ["Simulated", "Controlled lab", "Shadow factory", "Operational pilot", "Production readiness"]
+                    level = c2.selectbox("Validation level", level_opts, index=level_opts.index(r.get("validation_level")) if r.get("validation_level") in level_opts else 0)
+                    status_opts = ["Draft", "Planned", "Approved", "Setup in progress", "Ready to run", "Running", "Evidence review", "Analysis", "Completed", "Archived"]
+                    status = c1.selectbox("Status", status_opts, index=status_opts.index(r.get("status")) if r.get("status") in status_opts else 0)
+                    criteria = st.text_area("Success criteria", r.get("success_criteria") or "")
+                    notes = st.text_area("Notes", r.get("notes") or "")
+                    change_note = st.text_area("Change note")
+                    if st.form_submit_button("Save trial", type="primary"):
+                        update_record("trials", int(r["id"]), {"trial_name": edit_name.strip(), "project_id": edit_pid, "workstream_id": edit_ws_map.get(ws_label), "team_id": team_map.get(team_label), "trial_owner": owner_name, "trial_owner_user_id": owner_uid, "environment": environment, "process_type": process, "planned_date": planned, "model_version": model, "validation_level": level, "status": status, "success_criteria": criteria, "notes": notes, "updated_at": datetime.utcnow()}, actor, change_note or f"Trial '{edit_name.strip()}' updated")
+                        st.rerun()
+            record_timeline("trials", int(r["id"]))
 
 # -----------------------------
 # Evidence
 # -----------------------------
 elif page == "Evidence":
     st.markdown("### Evidence registry")
-    pmap=project_options()
+    pmap = project_options()
     if has_permission("evidence.write"):
         with st.expander("Register evidence"):
+            p_name = st.selectbox("Project", ["Unassigned"] + list(pmap), key="evidence_project")
+            pid = pmap.get(p_name)
+            trial_df = query_df("SELECT id,trial_name FROM trials WHERE project_id=:p ORDER BY id DESC", {"p": pid}) if pid else pd.DataFrame()
+            trial_map = {r["trial_name"]: int(r["id"]) for _, r in trial_df.iterrows()}
             with st.form("evidence_create"):
-                p_name=st.selectbox("Project",["Unassigned"]+list(pmap));pid=pmap.get(p_name)
-                c1,c2=st.columns(2); title=c1.text_input("Evidence title"); etype=c2.selectbox("Type",["Video","Image","Model output","Sensor log","Ground truth","Calibration","Operator feedback","Report","Other"])
-                source=c1.text_input("Source / system"); uri=c2.text_input("File or repository link")
-                version=c1.text_input("Model/software version"); status=c2.selectbox("Verification status",["Expected","Submitted","Under review","Verified","Rejected","Superseded"])
-                desc=st.text_area("Description")
+                c1, c2 = st.columns(2)
+                title = c1.text_input("Evidence title")
+                etype = c2.selectbox("Type", ["Video", "Image", "Model output", "Sensor log", "Ground truth", "Calibration", "Operator feedback", "Report", "Other"])
+                trial_label = c1.selectbox("Related trial", ["Project-level / none"] + list(trial_map))
+                source = c2.text_input("Source / system")
+                uri = st.text_input("Public file or repository link", help="Use a complete public or organization-accessible HTTPS link. Do not enter N/A or a local computer path.")
+                version = c1.text_input("Model/software version")
+                status = c2.selectbox("Verification status", ["Expected", "Submitted", "Under review", "Verified", "Rejected", "Superseded"])
+                desc = st.text_area("Description")
                 if st.form_submit_button("Register evidence", type="primary"):
                     normalized_uri = normalize_evidence_url(uri)
                     if not title.strip():
                         st.error("Evidence title is required.")
                     elif uri.strip() and not normalized_uri:
-                        st.error("Enter a valid public HTTP(S) link, or leave the link field blank. Local computer paths cannot be opened from Streamlit Cloud.")
+                        st.error("Enter a valid HTTPS link or leave the field blank. Placeholder values and local paths are not accepted.")
                     else:
-                        insert_record(
-                            "evidence_items",
-                            {
-                                "project_id": pid,
-                                "title": title.strip(),
-                                "evidence_type": etype,
-                                "source": source.strip(),
-                                "uri": normalized_uri,
-                                "model_version": version.strip(),
-                                "verification_status": status,
-                                "description": desc.strip(),
-                                "uploaded_by": actor,
-                                "uploaded_by_user_id": actor_id,
-                            },
-                            actor,
-                            f"Evidence '{title.strip()}' registered",
-                        )
-                        st.success("Evidence registered.")
+                        insert_record("evidence_items", {"project_id": pid, "trial_id": trial_map.get(trial_label), "title": title.strip(), "evidence_type": etype, "source": source.strip(), "uri": normalized_uri, "model_version": version.strip(), "verification_status": status, "description": desc.strip(), "uploaded_by": actor, "uploaded_by_user_id": actor_id}, actor, f"Evidence '{title.strip()}' registered")
                         st.rerun()
-    f1,f2=st.columns(2); project_filter=f1.selectbox("Project filter",["All"]+list(pmap)); status_filter=f2.selectbox("Verification",["All","Expected","Submitted","Under review","Verified","Rejected","Superseded"])
-    sql="SELECT e.*,p.name project_name FROM evidence_items e LEFT JOIN projects p ON p.id=e.project_id WHERE 1=1";params={}
-    if project_filter!="All":sql+=" AND e.project_id=:p";params['p']=pmap[project_filter]
-    if status_filter!="All":sql+=" AND e.verification_status=:s";params['s']=status_filter
-    sql+=" ORDER BY e.id DESC"
-    edf=query_df(sql,params)
-    if edf.empty: st.markdown('<div class="empty-state">No evidence records match this view.</div>',unsafe_allow_html=True)
+    f1, f2 = st.columns(2)
+    project_filter = f1.selectbox("Project filter", ["All"] + list(pmap))
+    status_filter = f2.selectbox("Verification", ["All", "Expected", "Submitted", "Under review", "Verified", "Rejected", "Superseded"])
+    sql = "SELECT e.*,p.name project_name,tr.trial_name FROM evidence_items e LEFT JOIN projects p ON p.id=e.project_id LEFT JOIN trials tr ON tr.id=e.trial_id WHERE 1=1"; params = {}
+    if project_filter != "All": sql += " AND e.project_id=:p"; params["p"] = pmap[project_filter]
+    if status_filter != "All": sql += " AND e.verification_status=:s"; params["s"] = status_filter
+    sql += " ORDER BY e.id DESC"
+    edf = query_df(sql, params)
+    if edf.empty: st.markdown('<div class="empty-state">No evidence records match this view.</div>', unsafe_allow_html=True)
     for _, r in edf.iterrows():
         evidence_url = normalize_evidence_url(r.get("uri"))
-        if evidence_url:
-            safe_url = html.escape(evidence_url, quote=True)
-            link = f'<a href="{safe_url}" target="_blank" rel="noopener noreferrer">Open evidence</a>'
-        elif str(r.get("uri") or "").strip():
-            link = "Invalid or inaccessible evidence link"
-        else:
-            link = "No external file linked"
-
-        render_card(
-            r["title"],
-            f"{r.get('project_name') or 'Unassigned'} · Uploaded by {r.get('uploaded_by') or 'Unknown'}",
-            [r.get("evidence_type"), r.get("verification_status"), r.get("model_version") or "No version"],
-            f"{r.get('description') or ''}<br>{link}",
-        )
+        link = f'<a href="{html.escape(evidence_url, quote=True)}" target="_blank" rel="noopener noreferrer">Open evidence</a>' if evidence_url else ("Invalid or inaccessible evidence link" if str(r.get("uri") or "").strip() else "No external file linked")
+        render_card(safe_text(r.get("title")), f"{safe_text(r.get('project_name'), 'Unassigned')} · Trial: {safe_text(r.get('trial_name'), 'Project-level')} · Uploaded by {safe_text(r.get('uploaded_by'), 'Unknown')}", [r.get("evidence_type"), r.get("verification_status"), r.get("model_version") or "No version"], f"{safe_text(r.get('description'), '')}<br>{link}")
         if has_permission("evidence.write"):
-            with st.expander("Review evidence"):
+            with st.expander("Review or correct evidence"):
                 with st.form(f"ev_{r['id']}"):
-                    status=st.selectbox("Verification status",["Expected","Submitted","Under review","Verified","Rejected","Superseded"],key=f"evs{r['id']}")
-                    verify_users=user_options(); verifier_label=st.selectbox("Verified/reviewed by", list(verify_users), index=list(verify_users.values()).index(actor_id) if actor_id in verify_users.values() else 0, key=f"evv{r['id']}") if verify_users else None; verified_by_user_id=verify_users.get(verifier_label) if verifier_label else None; verifier=(user_by_id(verified_by_user_id) or {}).get("display_name", actor)
-                    note=st.text_area("Review note",key=f"evn{r['id']}")
-                    if st.form_submit_button("Save review"):
-                        update_record("evidence_items",int(r['id']),{"verification_status":status,"verified_by":verifier,"verified_by_user_id":verified_by_user_id},actor,note or f"Evidence moved to {status}");st.rerun()
+                    status_opts = ["Expected", "Submitted", "Under review", "Verified", "Rejected", "Superseded"]
+                    status = st.selectbox("Verification status", status_opts, index=status_opts.index(r.get("verification_status")) if r.get("verification_status") in status_opts else 0)
+                    uri_value = st.text_input("Public evidence link", r.get("uri") or "")
+                    source = st.text_input("Source / system", r.get("source") or "")
+                    desc = st.text_area("Description", r.get("description") or "")
+                    verify_users = user_options(); verifier_label = st.selectbox("Verified/reviewed by", list(verify_users), index=list(verify_users.values()).index(actor_id) if actor_id in verify_users.values() else 0) if verify_users else None
+                    verified_by_user_id = verify_users.get(verifier_label) if verifier_label else None
+                    verifier = (user_by_id(verified_by_user_id) or {}).get("display_name", actor)
+                    note = st.text_area("Review note")
+                    if st.form_submit_button("Save evidence"):
+                        normalized = normalize_evidence_url(uri_value)
+                        if uri_value.strip() and not normalized:
+                            st.error("Enter a valid HTTPS link or clear the field.")
+                        else:
+                            update_record("evidence_items", int(r["id"]), {"verification_status": status, "uri": normalized, "source": source, "description": desc, "verified_by": verifier, "verified_by_user_id": verified_by_user_id}, actor, note or f"Evidence moved to {status}")
+                            st.rerun()
 
 # -----------------------------
 # Issues
@@ -1270,33 +1589,127 @@ elif page == "Issues":
 # -----------------------------
 elif page == "Outreach":
     st.markdown("### Manufacturer and stakeholder threads")
-    project_map=project_options()
+    project_map = project_options()
     if can_edit:
         with st.expander("Add outreach thread"):
             with st.form("outreach_new"):
-                p_name=st.selectbox("Project",["Unassigned"]+list(project_map)); pid=project_map.get(p_name)
-                c1,c2=st.columns(2); company=c1.text_input("Company"); contact=c2.text_input("Contact name")
-                outreach_users=user_options(); owner_label=c1.selectbox("Owner", list(outreach_users), index=list(outreach_users.values()).index(actor_id) if actor_id in outreach_users.values() else 0) if outreach_users else None; contact_owner_user_id=outreach_users.get(owner_label) if owner_label else None; owner=(user_by_id(contact_owner_user_id) or {}).get("display_name", actor); process=c2.text_input("Process / topic")
-                next_action=st.text_input("Next action"); notes=st.text_area("Notes")
-                if st.form_submit_button("Create outreach thread") and company:
-                    insert_record("outreach_contacts",{"project_id":pid,"company":company,"contact_name":contact,"contact_owner":owner,"contact_owner_user_id":contact_owner_user_id,"process_type":process,"status":"Identified","next_action":next_action,"notes":notes,"last_touchpoint":"Thread created"},actor,f"Outreach thread for {company} created");st.rerun()
-    rows=query_df("SELECT o.*,p.name project_name FROM outreach_contacts o LEFT JOIN projects p ON p.id=o.project_id ORDER BY o.id DESC")
-    for _,r in rows.iterrows():
-        render_card(r.get("company") or "Unnamed organization",f"{r.get('contact_name') or 'No contact'} · Owner: {r.get('contact_owner') or 'Unassigned'}",[r.get("status"),r.get("project_name") or "Legacy/unassigned"],f"<strong>Next:</strong> {r.get('next_action') or 'Not defined'}")
+                p_name = st.selectbox("Project", ["Unassigned"] + list(project_map)); pid = project_map.get(p_name)
+                c1, c2 = st.columns(2)
+                company = c1.text_input("Company")
+                contact = c2.text_input("Contact name")
+                outreach_users = user_options()
+                owner_label = c1.selectbox("Owner", list(outreach_users), index=list(outreach_users.values()).index(actor_id) if actor_id in outreach_users.values() else 0) if outreach_users else None
+                contact_owner_user_id = outreach_users.get(owner_label) if owner_label else None
+                owner = (user_by_id(contact_owner_user_id) or {}).get("display_name", actor)
+                process = c2.text_input("Process / topic")
+                latest_touch = c1.date_input("Latest touchpoint", value=None)
+                follow_up = c2.date_input("Follow-up date", value=None)
+                next_action = st.text_input("Next action")
+                notes = st.text_area("Notes")
+                if st.form_submit_button("Create outreach thread", type="primary"):
+                    if not company.strip():
+                        st.error("Company is required.")
+                    else:
+                        insert_record("outreach_contacts", {"project_id": pid, "company": company.strip(), "contact_name": contact.strip(), "contact_owner": owner, "contact_owner_user_id": contact_owner_user_id, "process_type": process, "status": "Identified", "next_action": next_action, "notes": notes, "latest_touchpoint_date": latest_touch, "last_touchpoint": latest_touch.isoformat() if latest_touch else None, "follow_up_date": follow_up}, actor, f"Outreach thread for {company.strip()} created")
+                        st.rerun()
+
+    f1, f2, f3, f4 = st.columns(4)
+    search = f1.text_input("Search company or contact")
+    project_filter = f2.selectbox("Project", ["All"] + list(project_map))
+    status_opts = ["All", "Identified", "Contact pending", "Contacted", "Follow-up due", "Response received", "Meeting scheduled", "Access confirmed", "Closed"]
+    status_filter = f3.selectbox("Status", status_opts)
+    owner_filter = f4.text_input("Owner contains")
+    sql = "SELECT o.*,p.name project_name FROM outreach_contacts o LEFT JOIN projects p ON p.id=o.project_id WHERE 1=1"; params = {}
+    if search.strip(): sql += " AND (o.company ILIKE :q OR o.contact_name ILIKE :q OR o.notes ILIKE :q)"; params["q"] = f"%{search.strip()}%"
+    if project_filter != "All": sql += " AND o.project_id=:p"; params["p"] = project_map[project_filter]
+    if status_filter != "All": sql += " AND o.status=:s"; params["s"] = status_filter
+    if owner_filter.strip(): sql += " AND o.contact_owner ILIKE :o"; params["o"] = f"%{owner_filter.strip()}%"
+    sql += " ORDER BY o.id DESC"
+    rows = query_df(sql, params)
+    if rows.empty: st.info("No outreach contacts match the selected filters.")
+    for _, r in rows.iterrows():
+        render_card(safe_text(r.get("company"), "Unnamed organization"), f"{safe_text(r.get('contact_name'), 'No contact')} · Owner: {safe_text(r.get('contact_owner'), 'Unassigned')}", [r.get("status"), r.get("project_name") or "Legacy/unassigned"], f"<strong>Next:</strong> {safe_text(r.get('next_action'), 'Not defined')}")
         with st.expander("Open thread"):
-            st.write(f"**Last touchpoint:** {r.get('last_touchpoint') or '—'}")
+            st.write(f"**Last touchpoint:** {r.get('latest_touchpoint_date') or r.get('last_touchpoint') or '—'}")
             st.write(f"**Follow-up:** {r.get('follow_up_date') or '—'}")
-            st.write(f"**Notes:** {r.get('notes') or '—'}")
+            st.write(f"**Notes:** {safe_text(r.get('notes'))}")
             if can_edit:
                 with st.form(f"outreach_{r['id']}"):
-                    status=st.selectbox("Status",["Identified","Contact pending","Contacted","Follow-up due","Response received","Meeting scheduled","Access confirmed","Closed"],key=f"os{r['id']}")
-                    touch=st.text_input("Latest touchpoint",key=f"ot{r['id']}")
-                    next_action=st.text_input("Next action",r.get("next_action") or "",key=f"on{r['id']}")
-                    note=st.text_area("Update note",key=f"ou{r['id']}")
-                    if st.form_submit_button("Add update"):
-                        update_record("outreach_contacts",int(r["id"]),{"status":status,"last_touchpoint":touch or r.get("last_touchpoint"),"next_action":next_action,"updated_at":datetime.utcnow()},actor,note or f"Outreach status moved to {status}");st.rerun()
-            comments_panel("outreach_contacts",int(r["id"]),actor,can_edit)
-            record_timeline("outreach_contacts",int(r["id"]))
+                    status = st.selectbox("Status", status_opts[1:], index=status_opts[1:].index(r.get("status")) if r.get("status") in status_opts[1:] else 0)
+                    c1, c2 = st.columns(2)
+                    touch = c1.date_input("Latest touchpoint", value=parse_optional_date(r.get("latest_touchpoint_date") or r.get("last_touchpoint")))
+                    follow = c2.date_input("Follow-up date", value=parse_optional_date(r.get("follow_up_date")))
+                    next_action = st.text_input("Next action", r.get("next_action") or "")
+                    notes = st.text_area("Notes", r.get("notes") or "")
+                    note = st.text_area("Update note")
+                    if st.form_submit_button("Save outreach update"):
+                        update_record("outreach_contacts", int(r["id"]), {"status": status, "latest_touchpoint_date": touch, "last_touchpoint": touch.isoformat() if touch else None, "follow_up_date": follow, "next_action": next_action, "notes": notes, "updated_at": datetime.utcnow()}, actor, note or f"Outreach status moved to {status}")
+                        st.rerun()
+            comments_panel("outreach_contacts", int(r["id"]), actor, can_edit)
+            record_timeline("outreach_contacts", int(r["id"]))
+
+# -----------------------------
+# Notifications
+# -----------------------------
+elif page == "Notifications":
+    st.markdown("### Notifications")
+    notifications = query_df("SELECT * FROM notifications WHERE recipient_user_id=:uid ORDER BY is_read,created_at DESC LIMIT 300", {"uid": actor_id})
+    if notifications.empty:
+        st.info("You have no notifications.")
+    else:
+        if st.button("Mark all as read"):
+            execute("UPDATE notifications SET is_read=TRUE WHERE recipient_user_id=:uid", {"uid": actor_id})
+            st.rerun()
+        for _, n in notifications.iterrows():
+            badge = "Unread" if not n.get("is_read") else "Read"
+            render_card(safe_text(n.get("title")), str(n.get("created_at")), [badge, n.get("entity_type") or "General"], safe_text(n.get("body"), ""))
+            if not n.get("is_read") and st.button("Mark read", key=f"notif_{n['id']}"):
+                execute("UPDATE notifications SET is_read=TRUE WHERE id=:id AND recipient_user_id=:uid", {"id": int(n["id"]), "uid": actor_id})
+                st.rerun()
+
+# -----------------------------
+# Messages
+# -----------------------------
+elif page == "Messages":
+    st.markdown("### Direct messages")
+    compose, inbox, sent = st.tabs(["Compose", "Inbox", "Sent"])
+    with compose:
+        users = user_options()
+        users = {label: uid for label, uid in users.items() if uid != actor_id}
+        with st.form("compose_message"):
+            recipient_label = st.selectbox("Recipient", list(users) if users else ["No available users"])
+            subject = st.text_input("Subject")
+            body = st.text_area("Message")
+            if st.form_submit_button("Send message", type="primary"):
+                if not users or recipient_label not in users:
+                    st.error("Select a recipient.")
+                elif not body.strip():
+                    st.error("Message cannot be empty.")
+                else:
+                    recipient_id = users[recipient_label]
+                    msg_id = insert_record("direct_messages", {"sender_user_id": actor_id, "recipient_user_id": recipient_id, "subject": subject.strip(), "body": body.strip()}, actor, f"Direct message sent to user {recipient_id}")
+                    create_notification(recipient_id, f"New message from {actor}", subject.strip() or body.strip()[:80], "direct_messages", msg_id, actor_id, "Messages")
+                    st.success("Message sent.")
+                    st.rerun()
+    with inbox:
+        messages = query_df("""SELECT m.*,u.display_name sender_name,u.email sender_email FROM direct_messages m JOIN users u ON u.id=m.sender_user_id WHERE m.recipient_user_id=:uid ORDER BY m.is_read,m.created_at DESC""", {"uid": actor_id})
+        if messages.empty: st.caption("Inbox is empty.")
+        for _, m in messages.iterrows():
+            render_card(safe_text(m.get("subject"), "No subject"), f"From {safe_text(m.get('sender_name'))} · {m.get('created_at')}", ["Unread" if not m.get("is_read") else "Read"], safe_text(m.get("body"), ""))
+            with st.expander("Open and reply"):
+                if not m.get("is_read"):
+                    execute("UPDATE direct_messages SET is_read=TRUE WHERE id=:id AND recipient_user_id=:uid", {"id": int(m["id"]), "uid": actor_id})
+                with st.form(f"reply_{m['id']}"):
+                    reply = st.text_area("Reply")
+                    if st.form_submit_button("Send reply") and reply.strip():
+                        reply_id = insert_record("direct_messages", {"sender_user_id": actor_id, "recipient_user_id": int(m["sender_user_id"]), "subject": f"Re: {m.get('subject') or 'Message'}", "body": reply.strip(), "parent_message_id": int(m["id"])}, actor, f"Reply sent to user {m['sender_user_id']}")
+                        create_notification(int(m["sender_user_id"]), f"Reply from {actor}", reply.strip()[:100], "direct_messages", reply_id, actor_id, "Messages")
+                        st.rerun()
+    with sent:
+        messages = query_df("""SELECT m.*,u.display_name recipient_name,u.email recipient_email FROM direct_messages m JOIN users u ON u.id=m.recipient_user_id WHERE m.sender_user_id=:uid ORDER BY m.created_at DESC""", {"uid": actor_id})
+        if messages.empty: st.caption("No sent messages.")
+        for _, m in messages.iterrows():
+            render_card(safe_text(m.get("subject"), "No subject"), f"To {safe_text(m.get('recipient_name'))} · {m.get('created_at')}", ["Read" if m.get("is_read") else "Unread"], safe_text(m.get("body"), ""))
 
 # -----------------------------
 # Analytics & readiness
@@ -1417,103 +1830,98 @@ elif page == "Administration":
         st.error("Administrator access is required.")
         st.stop()
     st.markdown("### Administration and migration safety")
-    st.warning("This page never drops or clears populated legacy tables. Use a Neon branch or export before any schema change.")
+    st.warning("All schema changes in this version are additive. Existing populated records are preserved; no table is dropped, truncated, or cleared.")
 
-    st.markdown("#### User accounts and access")
-    admin_count = active_administrator_count()
-    st.info(f"Active administrators: {admin_count} of 2. Public registration creates User accounts with Read access only.")
-
-    if admin_count < 2:
-        with st.expander("Create second administrator", expanded=True):
-            st.caption("Only an existing administrator can create the second administrator. This section disappears after two administrators exist.")
-            with st.form("create_second_admin"):
-                second_name = st.text_input("Full name")
-                second_email = st.text_input("Email")
-                second_password = st.text_input("Temporary password", type="password")
-                second_confirm = st.text_input("Confirm temporary password", type="password")
-                second_code = st.text_input("Bootstrap code", type="password")
-                create_second = st.form_submit_button("Create second administrator", type="primary")
-            if create_second:
-                normalized = second_email.strip().lower()
-                if active_administrator_count() >= 2:
-                    st.error("Two active administrators already exist.")
-                elif not bootstrap_secret() or not hmac.compare_digest(second_code, bootstrap_secret()):
-                    st.error("Invalid bootstrap code.")
-                elif not second_name.strip() or "@" not in normalized:
-                    st.error("Enter a valid name and email address.")
-                elif len(second_password) < 12:
-                    st.error("Use a password with at least 12 characters.")
-                elif second_password != second_confirm:
-                    st.error("Passwords do not match.")
-                elif fetch_one("SELECT id FROM users WHERE LOWER(email)=LOWER(:email)", {"email": normalized}):
-                    st.error("An account already exists with that email.")
-                else:
-                    insert_record("users", {"email": normalized, "display_name": second_name.strip(), "password_hash": ph.hash(second_password), "role": "Administrator", "access_level": "Write", "active": True}, actor, f"Second administrator created: {normalized}")
-                    st.success("Second administrator created.")
+    users_tab, admins_tab, data_tab = st.tabs(["User approvals", "Administrators", "Data safety"])
+    with users_tab:
+        user_df = query_df("""SELECT id,display_name,email,role,access_level,active,last_login_at,created_at FROM users WHERE role='User' ORDER BY created_at DESC""")
+        if user_df.empty:
+            st.info("No normal user accounts exist yet.")
+        else:
+            s1, s2 = st.columns(2)
+            user_search = s1.text_input("Search users", placeholder="Name or email")
+            access_filter = s2.selectbox("Access", ["All", "Read", "Write", "Inactive"])
+            filtered = user_df.copy()
+            if user_search.strip():
+                mask = filtered["display_name"].astype(str).str.contains(user_search, case=False, na=False) | filtered["email"].astype(str).str.contains(user_search, case=False, na=False)
+                filtered = filtered[mask]
+            if access_filter == "Inactive": filtered = filtered[filtered["active"] == False]
+            elif access_filter != "All": filtered = filtered[(filtered["access_level"] == access_filter) & (filtered["active"] == True)]
+            st.dataframe(filtered, use_container_width=True, hide_index=True)
+            if not filtered.empty:
+                user_map = {f"{r['display_name']} · {r['email']} · {r['access_level']}": int(r['id']) for _, r in filtered.iterrows()}
+                selected_user = st.selectbox("Select user", list(user_map))
+                selected_record = fetch_one("SELECT * FROM users WHERE id=:id", {"id": user_map[selected_user]})
+                memberships = query_df("""SELECT t.name,tm.team_role,tm.active FROM team_memberships tm JOIN teams t ON t.id=tm.team_id WHERE tm.user_id=:u ORDER BY t.name""", {"u": selected_record["id"]})
+                if not memberships.empty:
+                    st.markdown("**Team memberships**")
+                    st.dataframe(memberships, use_container_width=True, hide_index=True)
+                access_options = ["Read", "Write"]
+                current_access = selected_record.get("access_level") if selected_record.get("access_level") in access_options else "Read"
+                new_access = st.selectbox("Access level", access_options, index=access_options.index(current_access))
+                active_user = st.checkbox("Account active", value=bool(selected_record.get("active")))
+                if st.button("Save user access", type="primary"):
+                    old_access = selected_record.get("access_level") or "Read"
+                    old_active = bool(selected_record.get("active"))
+                    selected_id = int(selected_record["id"])
+                    update_record("users", selected_id, {"role": "User", "access_level": new_access, "active": active_user, "updated_at": datetime.utcnow()}, actor, f"User access updated for {selected_record['email']}")
+                    if not active_user:
+                        execute("UPDATE app_sessions SET revoked_at=CURRENT_TIMESTAMP WHERE user_id=:uid AND revoked_at IS NULL", {"uid": selected_id})
+                    message = f"Your ValidationOps access changed from {old_access} to {new_access}. Account status: {'Active' if active_user else 'Inactive'}."
+                    if old_access != new_access or old_active != active_user:
+                        create_notification(selected_id, "Account permission updated", message, "users", selected_id, actor_id, "Dashboard")
+                    st.success("User access updated and the user was notified.")
                     st.rerun()
 
-    user_df = query_df("""
-        SELECT id, display_name, email, role, access_level, active, last_login_at, created_at
-        FROM users ORDER BY CASE WHEN role='Administrator' THEN 0 ELSE 1 END, display_name
-    """)
-    st.dataframe(user_df, use_container_width=True, hide_index=True)
+    with admins_tab:
+        admin_count = active_administrator_count()
+        st.info(f"Active administrators: {admin_count} of 2. Public registration creates User accounts with Read access only.")
+        admins = query_df("SELECT id,display_name,email,access_level,active,last_login_at,created_at FROM users WHERE role='Administrator' ORDER BY created_at")
+        st.dataframe(admins, use_container_width=True, hide_index=True)
+        if admin_count < 2:
+            with st.expander("Create second administrator", expanded=True):
+                with st.form("create_second_admin"):
+                    second_name = st.text_input("Full name")
+                    second_email = st.text_input("Email")
+                    second_password = st.text_input("Temporary password", type="password")
+                    second_confirm = st.text_input("Confirm temporary password", type="password")
+                    second_code = st.text_input("Bootstrap code", type="password")
+                    create_second = st.form_submit_button("Create second administrator", type="primary")
+                if create_second:
+                    normalized = second_email.strip().lower()
+                    if active_administrator_count() >= 2: st.error("Two active administrators already exist.")
+                    elif not bootstrap_secret() or not hmac.compare_digest(second_code, bootstrap_secret()): st.error("Invalid bootstrap code.")
+                    elif not second_name.strip() or "@" not in normalized: st.error("Enter a valid name and email address.")
+                    elif len(second_password) < 12: st.error("Use a password with at least 12 characters.")
+                    elif second_password != second_confirm: st.error("Passwords do not match.")
+                    elif fetch_one("SELECT id FROM users WHERE LOWER(email)=LOWER(:email)", {"email": normalized}): st.error("An account already exists with that email.")
+                    else:
+                        insert_record("users", {"email": normalized, "display_name": second_name.strip(), "password_hash": ph.hash(second_password), "role": "Administrator", "access_level": "Write", "active": True}, actor, f"Second administrator created: {normalized}")
+                        st.rerun()
 
-    normal_users = user_df[user_df["role"] == "User"] if not user_df.empty else pd.DataFrame()
-    if not normal_users.empty:
-        with st.expander("Approve user access", expanded=True):
-            user_map = {f"{r['display_name']} · {r['email']}": int(r['id']) for _, r in normal_users.iterrows()}
-            selected_user = st.selectbox("User", list(user_map))
-            selected_record = fetch_one("SELECT * FROM users WHERE id=:id", {"id": user_map[selected_user]})
-            access_options = ["Read", "Write"]
-            current_access = selected_record.get("access_level") if selected_record.get("access_level") in access_options else "Read"
-            new_access = st.selectbox("Access level", access_options, index=access_options.index(current_access))
-            active_user = st.checkbox("Account active", value=bool(selected_record.get("active")))
-            if st.button("Save user access", type="primary"):
-                selected_id = int(selected_record["id"])
-                update_record("users", selected_id, {"role": "User", "access_level": new_access, "active": active_user, "updated_at": datetime.utcnow()}, actor, f"User access updated for {selected_record['email']}")
-                if not active_user:
-                    execute("UPDATE app_sessions SET revoked_at=CURRENT_TIMESTAMP WHERE user_id=:uid AND revoked_at IS NULL", {"uid": selected_id})
-                st.success("User access updated.")
-                st.rerun()
-    else:
-        st.caption("No normal user accounts are available for access approval yet.")
-
-    tables=["project_status","outreach_contacts","trials","ground_truth_logs","issue_logs","ux_test_logs","readiness_handoffs","projects","teams","workstreams","tasks","activity_log","users","app_sessions","project_memberships"]
-    counts=[]
-    for table in tables:
-        if table_exists(table):
-            row=fetch_one(f"SELECT COUNT(*) AS n FROM {table}"); counts.append({"Table":table,"Rows":row["n"]})
-    st.dataframe(pd.DataFrame(counts),use_container_width=True,hide_index=True)
-
-    if can_edit:
+    with data_tab:
+        tables = ["project_status", "outreach_contacts", "trials", "ground_truth_logs", "issue_logs", "ux_test_logs", "readiness_handoffs", "projects", "teams", "team_memberships", "workstreams", "tasks", "evidence_items", "activity_log", "users", "app_sessions", "project_memberships", "notifications", "direct_messages"]
+        counts = []
+        for table in tables:
+            if table_exists(table):
+                row = fetch_one(f"SELECT COUNT(*) AS n FROM {table}")
+                counts.append({"Table": table, "Rows": row["n"]})
+        st.dataframe(pd.DataFrame(counts), use_container_width=True, hide_index=True)
         st.markdown("#### Link existing legacy records to a project")
-        pmap=project_options()
+        pmap = project_options()
         if pmap:
-            p_name=st.selectbox("Target project",list(pmap));pid=pmap[p_name]
-            c1,c2,c3=st.columns(3)
+            p_name = st.selectbox("Target project", list(pmap)); pid = pmap[p_name]
+            c1, c2, c3 = st.columns(3)
             if c1.button("Link unassigned trials"):
-                result=execute("UPDATE trials SET project_id=:p WHERE project_id IS NULL",{"p":pid});st.success(f"Linked {result.rowcount} trials.")
+                result = execute("UPDATE trials SET project_id=:p WHERE project_id IS NULL", {"p": pid}); st.success(f"Linked {result.rowcount} trials.")
             if c2.button("Link unassigned issues"):
-                result=execute("UPDATE issue_logs SET project_id=:p WHERE project_id IS NULL",{"p":pid});st.success(f"Linked {result.rowcount} issues.")
+                result = execute("UPDATE issue_logs SET project_id=:p WHERE project_id IS NULL", {"p": pid}); st.success(f"Linked {result.rowcount} issues.")
             if c3.button("Link unassigned outreach"):
-                result=execute("UPDATE outreach_contacts SET project_id=:p WHERE project_id IS NULL",{"p":pid});st.success(f"Linked {result.rowcount} outreach records.")
-        st.markdown("#### Register existing rows in audit history")
-        if st.button("Backfill baseline history"):
-            tracked=["project_status","outreach_contacts","trials","ground_truth_logs","issue_logs","ux_test_logs","readiness_handoffs"]
-            inserted=0
-            with get_engine().begin() as conn:
-                for table in tracked:
-                    if not table_exists(table): continue
-                    rows=conn.execute(text(f"SELECT * FROM {table}")).mappings().all()
-                    for row in rows:
-                        exists=conn.execute(text("SELECT 1 FROM record_revisions WHERE entity_type=:e AND entity_id=:i LIMIT 1"),{"e":table,"i":row["id"]}).scalar()
-                        if exists: continue
-                        changes={k:{"old":None,"new":clean(v)} for k,v in dict(row).items() if k!="id"}
-                        log_activity(conn,table,int(row["id"]),"baseline","Existing record registered during safe migration.",actor,changes);inserted+=1
-            st.success(f"Registered {inserted} existing records without modifying them.")
-    st.markdown("#### Legacy data view")
-    selected=st.selectbox("Table",[t for t in tables if table_exists(t)])
-    st.dataframe(query_df(f"SELECT * FROM {selected} ORDER BY id"),use_container_width=True,hide_index=True)
+                result = execute("UPDATE outreach_contacts SET project_id=:p WHERE project_id IS NULL", {"p": pid}); st.success(f"Linked {result.rowcount} outreach records.")
+        st.markdown("#### Legacy data view")
+        existing_tables = [t for t in tables if table_exists(t)]
+        selected = st.selectbox("Table", existing_tables)
+        st.dataframe(query_df(f"SELECT * FROM {selected} ORDER BY id"), use_container_width=True, hide_index=True)
 
 st.divider()
-st.caption("IntelliAware ValidationOps v6.1 — two-administrator self-registration, administrator-managed read/write access and user-linked workflows.")
+st.caption("IntelliAware ValidationOps v7 — additive team membership, full workflow editing, approvals, notifications and messaging.")
