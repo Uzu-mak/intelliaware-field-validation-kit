@@ -2218,37 +2218,123 @@ elif page == "Evidence":
     pmap = project_options()
     if has_permission("evidence.write"):
         with st.expander("Register evidence"):
-            p_name = st.selectbox("Project", ["Unassigned"] + list(pmap), key="evidence_project")
-            pid = pmap.get(p_name)
-            trial_df = query_df("SELECT id,trial_name FROM trials WHERE project_id=:p ORDER BY id DESC", {"p": pid}) if pid else pd.DataFrame()
-            trial_map = {r["trial_name"]: int(r["id"]) for _, r in trial_df.iterrows()}
-            with st.form("evidence_create"):
-                c1, c2 = st.columns(2)
-                title = c1.text_input("Evidence title")
-                etype = c2.selectbox("Type", ["Interview notes", "Site observation", "Video", "Image", "Model output", "Sensor log", "Ground truth", "Calibration", "Operator feedback", "Report", "Other"])
-                trial_label = c1.selectbox("Related trial", ["Project-level / none"] + list(trial_map))
-                ws_df = query_df("SELECT id,name FROM workstreams WHERE project_id=:p ORDER BY name", {"p": pid}) if pid else pd.DataFrame()
-                ws_map = {r["name"]: int(r["id"]) for _,r in ws_df.iterrows()}
-                ws_label = c2.selectbox("Workstream", ["Unlinked"] + list(ws_map))
-                workstream_id = ws_map.get(ws_label)
-                outreach_df = query_df("SELECT id,company,contact_name FROM outreach_contacts WHERE project_id=:p AND (:w IS NULL OR workstream_id=:w) ORDER BY id DESC", {"p":pid,"w":workstream_id}) if pid else pd.DataFrame()
-                outreach_map = {f"#{int(r['id'])} · {r['company']} · {r.get('contact_name') or ''}": int(r['id']) for _,r in outreach_df.iterrows()}
-                outreach_label = c1.selectbox("Source interview / site visit", ["Unlinked"] + list(outreach_map))
-                outreach_id = outreach_map.get(outreach_label)
-                source = c2.text_input("Source / system")
-                uri = st.text_input("Public file or repository link", help="Use a complete public or organization-accessible HTTPS link. Do not enter N/A or a local computer path.")
-                version = c1.text_input("Model/software version")
-                status = c2.selectbox("Verification status", ["Expected", "Submitted", "Under review", "Verified", "Rejected", "Superseded"])
-                desc = st.text_area("Description")
-                if st.form_submit_button("Register evidence", type="primary"):
-                    normalized_uri = normalize_evidence_url(uri)
-                    if not title.strip():
-                        st.error("Evidence title is required.")
-                    elif uri.strip() and not normalized_uri:
-                        st.error("Enter a valid HTTPS link or leave the field blank. Placeholder values and local paths are not accepted.")
-                    else:
-                        insert_record("evidence_items", {"project_id": pid, "workstream_id": workstream_id, "outreach_id": outreach_id, "trial_id": trial_map.get(trial_label), "title": title.strip(), "evidence_type": etype, "source": source.strip(), "uri": normalized_uri, "model_version": version.strip(), "verification_status": status, "description": desc.strip(), "uploaded_by": actor, "uploaded_by_user_id": actor_id}, actor, f"Evidence '{title.strip()}' registered")
-                        st.rerun()
+            evidence_project_label = st.selectbox(
+                "Project",
+                list(pmap),
+                key="evidence_project",
+            ) if pmap else None
+            evidence_project_id = pmap.get(evidence_project_label) if evidence_project_label else None
+
+            evidence_ws_df = query_df(
+                "SELECT id,name FROM workstreams WHERE project_id=:p ORDER BY name",
+                {"p": evidence_project_id},
+            ) if evidence_project_id else pd.DataFrame()
+            evidence_ws_map = {
+                f"{r['name']} (ID {int(r['id'])})": int(r["id"])
+                for _, r in evidence_ws_df.iterrows()
+            }
+
+            if not evidence_project_id:
+                st.warning("Create a project before registering workflow evidence.")
+            elif not evidence_ws_map:
+                st.warning("The selected project has no workstreams.")
+            else:
+                evidence_ws_label = st.selectbox(
+                    "Workstream",
+                    list(evidence_ws_map),
+                    key="evidence_workstream",
+                )
+                evidence_workstream_id = evidence_ws_map[evidence_ws_label]
+
+                outreach_df = query_df(
+                    """
+                    SELECT id,company,contact_name
+                    FROM outreach_contacts
+                    WHERE project_id=:p AND workstream_id=:w
+                    ORDER BY id DESC
+                    """,
+                    {"p": evidence_project_id, "w": evidence_workstream_id},
+                )
+                outreach_map = {
+                    f"#{int(r['id'])} · {r['company']} · {r.get('contact_name') or ''}": int(r["id"])
+                    for _, r in outreach_df.iterrows()
+                }
+
+                if not outreach_map:
+                    st.warning(
+                        "No outreach interview or site visit is linked to this workstream. "
+                        "Create the outreach record before registering its evidence."
+                    )
+                else:
+                    outreach_label = st.selectbox(
+                        "Source interview / site visit",
+                        list(outreach_map),
+                        key="evidence_outreach",
+                    )
+                    outreach_id = outreach_map[outreach_label]
+
+                    trial_df = query_df(
+                        "SELECT id,trial_name FROM trials WHERE project_id=:p ORDER BY id DESC",
+                        {"p": evidence_project_id},
+                    )
+                    trial_map = {
+                        f"{r['trial_name']} (ID {int(r['id'])})": int(r["id"])
+                        for _, r in trial_df.iterrows()
+                    }
+
+                    with st.form("evidence_create", clear_on_submit=True):
+                        c1, c2 = st.columns(2)
+                        title = c1.text_input("Evidence title")
+                        etype = c2.selectbox(
+                            "Type",
+                            ["Interview notes", "Site observation", "Video", "Image", "Model output", "Sensor log", "Ground truth", "Calibration", "Operator feedback", "Report", "Other"],
+                        )
+                        trial_label = c1.selectbox("Related trial", ["Project-level / none"] + list(trial_map))
+                        source = c2.text_input("Source / system")
+                        uri = st.text_input(
+                            "Public file or repository link",
+                            help="Use a complete public or organization-accessible HTTPS link. Do not enter N/A or a local computer path.",
+                        )
+                        version = c1.text_input("Model/software version")
+                        status = c2.selectbox(
+                            "Verification status",
+                            ["Expected", "Submitted", "Under review", "Verified", "Rejected", "Superseded"],
+                        )
+                        desc = st.text_area("Description")
+                        submitted = st.form_submit_button("Register evidence", type="primary")
+
+                    if submitted:
+                        normalized_uri = normalize_evidence_url(uri)
+                        if not title.strip():
+                            st.error("Evidence title is required.")
+                        elif uri.strip() and not normalized_uri:
+                            st.error(
+                                "Enter a valid HTTPS link or leave the field blank. "
+                                "Placeholder values and local paths are not accepted."
+                            )
+                        else:
+                            insert_record(
+                                "evidence_items",
+                                {
+                                    "project_id": evidence_project_id,
+                                    "workstream_id": evidence_workstream_id,
+                                    "outreach_id": outreach_id,
+                                    "trial_id": trial_map.get(trial_label),
+                                    "title": title.strip(),
+                                    "evidence_type": etype,
+                                    "source": source.strip(),
+                                    "uri": normalized_uri,
+                                    "model_version": version.strip(),
+                                    "verification_status": status,
+                                    "description": desc.strip(),
+                                    "uploaded_by": actor,
+                                    "uploaded_by_user_id": actor_id,
+                                },
+                                actor,
+                                f"Evidence '{title.strip()}' registered",
+                            )
+                            st.success("Evidence registered and linked to the outreach record.")
+                            st.rerun()
     f1, f2 = st.columns(2)
     project_filter = f1.selectbox("Project filter", ["All"] + list(pmap))
     status_filter = f2.selectbox("Verification", ["All", "Expected", "Submitted", "Under review", "Verified", "Rejected", "Superseded"])
@@ -2290,18 +2376,139 @@ elif page == "Issues":
     project_map=project_options()
     if has_permission("issue.write"):
         with st.expander("Report issue"):
-            with st.form("create_issue"):
-                p_name=st.selectbox("Project",["Unassigned"]+list(project_map)); pid=project_map.get(p_name)
-                c1,c2=st.columns(2); issue_id=c1.text_input("Issue key",value=f"ISS-{datetime.now().strftime('%H%M%S')}"); title=c2.text_input("Title")
-                severity=c1.selectbox("Severity",["Low","Medium","High","Critical"]); priority=c2.selectbox("Priority",["Low","Medium","High","Critical"],index=1)
-                issue_users=user_options(); owner_label=c1.selectbox("Owner", ["Unassigned"]+list(issue_users)); owner_user_id=issue_users.get(owner_label); owner=(user_by_id(owner_user_id) or {}).get("display_name", "") if owner_user_id else ""; environment=c2.text_input("Environment")
-                ws_df=query_df("SELECT id,name FROM workstreams WHERE project_id=:p ORDER BY name",{"p":pid}) if pid else pd.DataFrame(); ws_map={r['name']:int(r['id']) for _,r in ws_df.iterrows()}; ws_label=c1.selectbox("Workstream",["Unlinked"]+list(ws_map)); workstream_id=ws_map.get(ws_label)
-                outreach_df=query_df("SELECT id,company,contact_name FROM outreach_contacts WHERE project_id=:p AND (:w IS NULL OR workstream_id=:w) ORDER BY id DESC",{"p":pid,"w":workstream_id}) if pid else pd.DataFrame(); outreach_map={f"#{int(r['id'])} · {r['company']} · {r.get('contact_name') or ''}":int(r['id']) for _,r in outreach_df.iterrows()}; outreach_label=c2.selectbox("Source interview / site visit",["Unlinked"]+list(outreach_map)); outreach_id=outreach_map.get(outreach_label)
-                evidence_df=query_df("SELECT id,title FROM evidence_items WHERE project_id=:p AND (:w IS NULL OR workstream_id=:w) AND (:o IS NULL OR outreach_id=:o) ORDER BY id DESC",{"p":pid,"w":workstream_id,"o":outreach_id}) if pid else pd.DataFrame(); evidence_map={f"#{int(r['id'])} · {r['title']}":int(r['id']) for _,r in evidence_df.iterrows()}; evidence_label=st.selectbox("Supporting evidence",["Unlinked"]+list(evidence_map)); evidence_id=evidence_map.get(evidence_label)
-                observed=st.text_area("Observed problem / validated finding"); expected=st.text_area("Desired condition"); fix=st.text_area("Initial product implication")
-                if st.form_submit_button("Create issue") and title:
-                    insert_record("issue_logs",{"issue_id":issue_id,"title":title,"project_id":pid,"workstream_id":workstream_id,"outreach_id":outreach_id,"evidence_id":evidence_id,"severity":severity,"priority":priority,"owner":owner,"owner_user_id":owner_user_id,"environment":environment,"observed_behavior":observed,"expected_behavior":expected,"suggested_fix":fix,"status":"Reported"},actor,f"Issue {issue_id} created")
-                    st.rerun()
+            issue_project_label = st.selectbox(
+                "Project",
+                list(project_map),
+                key="issue_create_project",
+            ) if project_map else None
+            issue_project_id = project_map.get(issue_project_label) if issue_project_label else None
+
+            issue_ws_df = query_df(
+                "SELECT id,name FROM workstreams WHERE project_id=:p ORDER BY name",
+                {"p": issue_project_id},
+            ) if issue_project_id else pd.DataFrame()
+            issue_ws_map = {
+                f"{r['name']} (ID {int(r['id'])})": int(r["id"])
+                for _, r in issue_ws_df.iterrows()
+            }
+
+            if not issue_project_id:
+                st.warning("Create a project before reporting a workflow issue.")
+            elif not issue_ws_map:
+                st.warning("The selected project has no workstreams.")
+            else:
+                issue_ws_label = st.selectbox(
+                    "Workstream",
+                    list(issue_ws_map),
+                    key="issue_create_workstream",
+                )
+                issue_workstream_id = issue_ws_map[issue_ws_label]
+
+                outreach_df = query_df(
+                    """
+                    SELECT id,company,contact_name
+                    FROM outreach_contacts
+                    WHERE project_id=:p AND workstream_id=:w
+                    ORDER BY id DESC
+                    """,
+                    {"p": issue_project_id, "w": issue_workstream_id},
+                )
+                outreach_map = {
+                    f"#{int(r['id'])} · {r['company']} · {r.get('contact_name') or ''}": int(r["id"])
+                    for _, r in outreach_df.iterrows()
+                }
+
+                if not outreach_map:
+                    st.warning(
+                        "No outreach interview or site visit is linked to this workstream. "
+                        "Create the outreach record first."
+                    )
+                else:
+                    outreach_label = st.selectbox(
+                        "Source interview / site visit",
+                        list(outreach_map),
+                        key="issue_create_outreach",
+                    )
+                    outreach_id = outreach_map[outreach_label]
+
+                    evidence_df = query_df(
+                        """
+                        SELECT id,title
+                        FROM evidence_items
+                        WHERE project_id=:p
+                          AND workstream_id=:w
+                          AND outreach_id=:o
+                        ORDER BY id DESC
+                        """,
+                        {"p": issue_project_id, "w": issue_workstream_id, "o": outreach_id},
+                    )
+                    evidence_map = {
+                        f"#{int(r['id'])} · {r['title']}": int(r["id"])
+                        for _, r in evidence_df.iterrows()
+                    }
+
+                    if not evidence_map:
+                        st.warning(
+                            "No supporting evidence is linked to this outreach record. "
+                            "Register the evidence first."
+                        )
+                    else:
+                        evidence_label = st.selectbox(
+                            "Supporting evidence",
+                            list(evidence_map),
+                            key="issue_create_evidence",
+                        )
+                        evidence_id = evidence_map[evidence_label]
+
+                        with st.form("create_issue", clear_on_submit=True):
+                            c1, c2 = st.columns(2)
+                            issue_key = c1.text_input(
+                                "Issue key",
+                                value=f"ISS-{datetime.now().strftime('%H%M%S')}",
+                            )
+                            title = c2.text_input("Title")
+                            severity = c1.selectbox("Severity", ["Low", "Medium", "High", "Critical"])
+                            priority = c2.selectbox("Priority", ["Low", "Medium", "High", "Critical"], index=1)
+                            issue_users = user_options()
+                            owner_label = c1.selectbox("Owner", ["Unassigned"] + list(issue_users))
+                            owner_user_id = issue_users.get(owner_label)
+                            owner = (user_by_id(owner_user_id) or {}).get("display_name", "") if owner_user_id else ""
+                            environment = c2.text_input("Environment")
+                            observed = st.text_area("Observed problem / validated finding")
+                            expected = st.text_area("Desired condition")
+                            fix = st.text_area("Initial product implication")
+                            submitted = st.form_submit_button("Create issue")
+
+                        if submitted:
+                            if not title.strip():
+                                st.error("Issue title is required.")
+                            elif not observed.strip():
+                                st.error("Observed problem or validated finding is required.")
+                            else:
+                                insert_record(
+                                    "issue_logs",
+                                    {
+                                        "issue_id": issue_key,
+                                        "title": title.strip(),
+                                        "project_id": issue_project_id,
+                                        "workstream_id": issue_workstream_id,
+                                        "outreach_id": outreach_id,
+                                        "evidence_id": evidence_id,
+                                        "severity": severity,
+                                        "priority": priority,
+                                        "owner": owner,
+                                        "owner_user_id": owner_user_id,
+                                        "environment": environment,
+                                        "observed_behavior": observed.strip(),
+                                        "expected_behavior": expected.strip(),
+                                        "suggested_fix": fix.strip(),
+                                        "status": "Reported",
+                                    },
+                                    actor,
+                                    f"Issue {issue_key} created",
+                                )
+                                st.success("Issue created with full outreach and evidence traceability.")
+                                st.rerun()
     issues=query_df("SELECT i.*,p.name project_name FROM issue_logs i LEFT JOIN projects p ON p.id=i.project_id ORDER BY CASE LOWER(i.severity) WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 ELSE 4 END,i.id DESC")
     f1,f2,f3=st.columns(3); sev_filter=f1.selectbox("Severity",["All","Critical","High","Medium","Low"]); status_filter=f2.selectbox("Status",["All","Reported","Triaged","Assigned","Under investigation","Root cause identified","Fix in progress","Ready for retest","Retesting","Verified","Closed","Deferred"]); owner_filter=f3.text_input("Owner contains")
     if sev_filter!="All":issues=issues[issues["severity"].astype(str).str.lower()==sev_filter.lower()]
@@ -2334,29 +2541,122 @@ elif page == "Outreach":
     project_map = project_options()
     if can_edit:
         with st.expander("Add outreach thread"):
-            with st.form("outreach_new"):
-                p_name = st.selectbox("Project", ["Unassigned"] + list(project_map)); pid = project_map.get(p_name)
-                c1, c2 = st.columns(2)
-                company = c1.text_input("Company")
-                contact = c2.text_input("Contact name")
-                outreach_users = user_options()
-                owner_label = c1.selectbox("Owner", list(outreach_users), index=list(outreach_users.values()).index(actor_id) if actor_id in outreach_users.values() else 0) if outreach_users else None
-                contact_owner_user_id = outreach_users.get(owner_label) if owner_label else None
-                owner = (user_by_id(contact_owner_user_id) or {}).get("display_name", actor)
-                process = c2.text_input("Process / topic")
-                ws_df=query_df("SELECT id,name FROM workstreams WHERE project_id=:p ORDER BY name",{"p":pid}) if pid else pd.DataFrame(); ws_map={r['name']:int(r['id']) for _,r in ws_df.iterrows()}; ws_label=c1.selectbox("Workstream",["Unlinked"]+list(ws_map)); workstream_id=ws_map.get(ws_label)
-                task_df=query_df("SELECT id,title FROM tasks WHERE project_id=:p AND (:w IS NULL OR workstream_id=:w) ORDER BY title",{"p":pid,"w":workstream_id}) if pid else pd.DataFrame(); task_map={r['title']:int(r['id']) for _,r in task_df.iterrows()}; task_label=c2.selectbox("Outreach task",["Unlinked"]+list(task_map)); task_id=task_map.get(task_label)
-                engagement_type=c1.selectbox("Engagement type",["Interview","Site visit","Product feedback meeting","Follow-up call","Email exchange"]); engagement_date=c2.date_input("Engagement date",value=None)
-                latest_touch = c1.date_input("Latest touchpoint", value=None)
-                follow_up = c2.date_input("Follow-up date", value=None)
-                next_action = st.text_input("Next action")
-                notes = st.text_area("Notes")
-                if st.form_submit_button("Create outreach thread", type="primary"):
-                    if not company.strip():
-                        st.error("Company is required.")
-                    else:
-                        insert_record("outreach_contacts", {"project_id": pid, "workstream_id": workstream_id, "task_id": task_id, "engagement_type": engagement_type, "engagement_date": engagement_date, "company": company.strip(), "contact_name": contact.strip(), "contact_owner": owner, "contact_owner_user_id": contact_owner_user_id, "process_type": process, "status": "Identified", "next_action": next_action, "notes": notes, "latest_touchpoint_date": latest_touch, "last_touchpoint": latest_touch.isoformat() if latest_touch else None, "follow_up_date": follow_up}, actor, f"Outreach thread for {company.strip()} created")
-                        st.rerun()
+            # Keep dependent selectors outside the form so Streamlit reruns
+            # when the project or workstream changes.
+            p_name = st.selectbox(
+                "Project",
+                list(project_map),
+                key="outreach_create_project",
+            ) if project_map else None
+            pid = project_map.get(p_name) if p_name else None
+
+            ws_df = query_df(
+                "SELECT id,name FROM workstreams WHERE project_id=:p ORDER BY name",
+                {"p": pid},
+            ) if pid else pd.DataFrame()
+            ws_map = {
+                f"{r['name']} (ID {int(r['id'])})": int(r["id"])
+                for _, r in ws_df.iterrows()
+            }
+
+            if not pid:
+                st.warning("Create a project before adding outreach.")
+            elif not ws_map:
+                st.warning(
+                    "This project has no workstreams. Create a workstream under "
+                    "the selected project before adding outreach."
+                )
+            else:
+                ws_label = st.selectbox(
+                    "Workstream",
+                    list(ws_map),
+                    key="outreach_create_workstream",
+                )
+                workstream_id = ws_map[ws_label]
+
+                task_df = query_df(
+                    """
+                    SELECT id,title
+                    FROM tasks
+                    WHERE project_id=:p AND workstream_id=:w
+                    ORDER BY title
+                    """,
+                    {"p": pid, "w": workstream_id},
+                )
+                task_map = {
+                    f"{r['title']} (ID {int(r['id'])})": int(r["id"])
+                    for _, r in task_df.iterrows()
+                }
+
+                if not task_map:
+                    st.warning(
+                        "This workstream has no tasks. Create an outreach task in "
+                        "My Work before recording the engagement."
+                    )
+                else:
+                    task_label = st.selectbox(
+                        "Outreach task",
+                        list(task_map),
+                        key="outreach_create_task",
+                    )
+                    task_id = task_map[task_label]
+
+                    with st.form("outreach_new", clear_on_submit=True):
+                        c1, c2 = st.columns(2)
+                        company = c1.text_input("Company")
+                        contact = c2.text_input("Contact name")
+                        outreach_users = user_options()
+                        owner_label = c1.selectbox(
+                            "Owner",
+                            list(outreach_users),
+                            index=list(outreach_users.values()).index(actor_id)
+                            if actor_id in outreach_users.values() else 0,
+                        ) if outreach_users else None
+                        contact_owner_user_id = outreach_users.get(owner_label) if owner_label else None
+                        owner = (user_by_id(contact_owner_user_id) or {}).get("display_name", actor)
+                        process = c2.text_input("Process / topic")
+                        engagement_type = c1.selectbox(
+                            "Engagement type",
+                            ["Interview", "Site visit", "Product feedback meeting", "Follow-up call", "Email exchange"],
+                        )
+                        engagement_date = c2.date_input("Engagement date", value=None)
+                        latest_touch = c1.date_input("Latest touchpoint", value=None)
+                        follow_up = c2.date_input("Follow-up date", value=None)
+                        next_action = st.text_input("Next action")
+                        notes = st.text_area("Notes")
+                        submitted = st.form_submit_button("Create outreach thread", type="primary")
+
+                    if submitted:
+                        if not company.strip():
+                            st.error("Company is required.")
+                        elif engagement_date and latest_touch and latest_touch < engagement_date:
+                            st.error("Latest touchpoint cannot be before the engagement date.")
+                        else:
+                            insert_record(
+                                "outreach_contacts",
+                                {
+                                    "project_id": pid,
+                                    "workstream_id": workstream_id,
+                                    "task_id": task_id,
+                                    "engagement_type": engagement_type,
+                                    "engagement_date": engagement_date,
+                                    "company": company.strip(),
+                                    "contact_name": contact.strip(),
+                                    "contact_owner": owner,
+                                    "contact_owner_user_id": contact_owner_user_id,
+                                    "process_type": process,
+                                    "status": "Identified",
+                                    "next_action": next_action,
+                                    "notes": notes,
+                                    "latest_touchpoint_date": latest_touch,
+                                    "last_touchpoint": latest_touch.isoformat() if latest_touch else None,
+                                    "follow_up_date": follow_up,
+                                },
+                                actor,
+                                f"Outreach thread for {company.strip()} created",
+                            )
+                            st.success("Outreach thread created and linked to the selected workstream and task.")
+                            st.rerun()
 
     f1, f2, f3, f4 = st.columns(4)
     search = f1.text_input("Search company or contact")
