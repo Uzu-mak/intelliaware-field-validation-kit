@@ -444,6 +444,44 @@ def init_schema():
         PRIMARY KEY(meeting_id, user_id)
     );
     CREATE INDEX IF NOT EXISTS idx_meeting_participants_user ON meeting_participants(user_id, response_status);
+
+    CREATE TABLE IF NOT EXISTS product_requirements (
+        id BIGSERIAL PRIMARY KEY, project_id BIGINT NOT NULL REFERENCES projects(id),
+        workstream_id BIGINT NOT NULL REFERENCES workstreams(id), outreach_id BIGINT, issue_id BIGINT,
+        title TEXT NOT NULL, problem_statement TEXT NOT NULL, requirement_statement TEXT NOT NULL,
+        affected_users TEXT, expected_value TEXT, priority TEXT NOT NULL DEFAULT 'Medium',
+        status TEXT NOT NULL DEFAULT 'Draft', owner_user_id BIGINT REFERENCES users(id),
+        created_by_user_id BIGINT REFERENCES users(id), created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_requirements_workstream ON product_requirements(workstream_id, status);
+
+    CREATE TABLE IF NOT EXISTS recommendations (
+        id BIGSERIAL PRIMARY KEY, project_id BIGINT NOT NULL REFERENCES projects(id),
+        workstream_id BIGINT NOT NULL REFERENCES workstreams(id), requirement_id BIGINT NOT NULL REFERENCES product_requirements(id),
+        title TEXT NOT NULL, recommendation_text TEXT NOT NULL, evidence_summary TEXT, expected_value TEXT,
+        proposed_priority TEXT DEFAULT 'Medium', status TEXT NOT NULL DEFAULT 'Draft',
+        submitted_by_user_id BIGINT REFERENCES users(id), submitted_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_recommendations_workstream ON recommendations(workstream_id, status);
+
+    CREATE TABLE IF NOT EXISTS stakeholder_decisions (
+        id BIGSERIAL PRIMARY KEY, project_id BIGINT NOT NULL REFERENCES projects(id),
+        workstream_id BIGINT NOT NULL REFERENCES workstreams(id), recommendation_id BIGINT NOT NULL REFERENCES recommendations(id),
+        decision TEXT NOT NULL, decision_maker TEXT NOT NULL, decision_date DATE NOT NULL, comments TEXT, next_action TEXT,
+        created_by_user_id BIGINT REFERENCES users(id), created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_decisions_workstream ON stakeholder_decisions(workstream_id, decision_date DESC);
+
+    CREATE TABLE IF NOT EXISTS value_assessments (
+        id BIGSERIAL PRIMARY KEY, project_id BIGINT NOT NULL REFERENCES projects(id), workstream_id BIGINT REFERENCES workstreams(id),
+        metric_name TEXT NOT NULL, baseline_value NUMERIC, current_value NUMERIC, target_value NUMERIC, unit TEXT,
+        value_category TEXT NOT NULL DEFAULT 'Operational', measurement_method TEXT, confidence TEXT DEFAULT 'Medium',
+        evidence_note TEXT, recorded_by_user_id BIGINT REFERENCES users(id),
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_value_assessments_project ON value_assessments(project_id, workstream_id);
     """
     execute(sql)
 
@@ -492,6 +530,19 @@ def init_schema():
     ALTER TABLE meetings ADD COLUMN IF NOT EXISTS delivery_error TEXT;
     ALTER TABLE meetings ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
     ALTER TABLE activity_log ADD COLUMN IF NOT EXISTS hidden BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE outreach_contacts ADD COLUMN IF NOT EXISTS workstream_id BIGINT REFERENCES workstreams(id);
+    ALTER TABLE outreach_contacts ADD COLUMN IF NOT EXISTS task_id BIGINT REFERENCES tasks(id);
+    ALTER TABLE outreach_contacts ADD COLUMN IF NOT EXISTS meeting_id BIGINT REFERENCES meetings(id);
+    ALTER TABLE outreach_contacts ADD COLUMN IF NOT EXISTS engagement_type TEXT;
+    ALTER TABLE outreach_contacts ADD COLUMN IF NOT EXISTS engagement_date DATE;
+    ALTER TABLE outreach_contacts ADD COLUMN IF NOT EXISTS findings_summary TEXT;
+    ALTER TABLE outreach_contacts ADD COLUMN IF NOT EXISTS feedback_value TEXT;
+    ALTER TABLE outreach_contacts ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+    ALTER TABLE evidence_items ADD COLUMN IF NOT EXISTS workstream_id BIGINT REFERENCES workstreams(id);
+    ALTER TABLE evidence_items ADD COLUMN IF NOT EXISTS outreach_id BIGINT;
+    ALTER TABLE evidence_items ADD COLUMN IF NOT EXISTS issue_id BIGINT;
+    ALTER TABLE issue_logs ADD COLUMN IF NOT EXISTS outreach_id BIGINT;
+    ALTER TABLE issue_logs ADD COLUMN IF NOT EXISTS evidence_id BIGINT REFERENCES evidence_items(id);
     """
     execute(alter_sql)
 
@@ -890,6 +941,71 @@ def user_by_id(user_id: int | None):
 
 
 
+def project_date_bounds(project_id: int | None):
+    if not project_id:
+        return None, None
+    row = fetch_one("SELECT start_date, target_date FROM projects WHERE id=:id", {"id": project_id}) or {}
+    return parse_optional_date(row.get("start_date")), parse_optional_date(row.get("target_date"))
+
+
+def validate_workstream_dates(project_id: int, start_date, due_date) -> str | None:
+    project_start, project_end = project_date_bounds(project_id)
+    if start_date and due_date and start_date > due_date:
+        return "Workstream start date cannot be after its due date."
+    if project_start and start_date and start_date < project_start:
+        return f"Workstream start date must be on or after the project start date ({project_start})."
+    if project_end and due_date and due_date > project_end:
+        return f"Workstream due date must be on or before the project target date ({project_end})."
+    if project_start and due_date and due_date < project_start:
+        return f"Workstream due date cannot be before the project start date ({project_start})."
+    if project_end and start_date and start_date > project_end:
+        return f"Workstream start date cannot be after the project target date ({project_end})."
+    return None
+
+
+def can_edit_workstream(row) -> bool:
+    current = st.session_state.get("current_user") or {}
+    if current.get("role") == "Administrator":
+        return True
+    if row is None or current.get("access_level") != "Write":
+        return False
+    uid = int(current.get("id") or 0)
+    owner_id = row.get("owner_user_id")
+    team_id = row.get("team_id")
+    return (owner_id is not None and int(owner_id) == uid) or user_leads_team(uid, int(team_id) if team_id else None)
+
+
+def workflow_counts(project_id: int, workstream_id: int):
+    def count(sql, params):
+        row = fetch_one(sql, params) or {}
+        return int(row.get("n") or 0)
+    params = {"p": project_id, "w": workstream_id}
+    return {
+        "tasks": count("SELECT COUNT(*) AS n FROM tasks WHERE project_id=:p AND workstream_id=:w", params),
+        "completed_tasks": count("SELECT COUNT(*) AS n FROM tasks WHERE project_id=:p AND workstream_id=:w AND LOWER(COALESCE(status,'')) IN ('completed','closed')", params),
+        "outreach": count("SELECT COUNT(*) AS n FROM outreach_contacts WHERE project_id=:p AND workstream_id=:w", params),
+        "completed_outreach": count("SELECT COUNT(*) AS n FROM outreach_contacts WHERE project_id=:p AND workstream_id=:w AND LOWER(COALESCE(status,'')) IN ('interview completed','visit completed','completed','closed')", params),
+        "evidence": count("SELECT COUNT(*) AS n FROM evidence_items WHERE project_id=:p AND workstream_id=:w", params),
+        "issues": count("SELECT COUNT(*) AS n FROM issue_logs WHERE project_id=:p AND workstream_id=:w", params),
+        "requirements": count("SELECT COUNT(*) AS n FROM product_requirements WHERE project_id=:p AND workstream_id=:w", params),
+        "recommendations": count("SELECT COUNT(*) AS n FROM recommendations WHERE project_id=:p AND workstream_id=:w AND LOWER(status) IN ('submitted','reviewed','decided')", params),
+        "decisions": count("SELECT COUNT(*) AS n FROM stakeholder_decisions WHERE project_id=:p AND workstream_id=:w", params),
+    }
+
+
+def workflow_completion_check(project_id: int, workstream_id: int):
+    c = workflow_counts(project_id, workstream_id)
+    missing = []
+    if c["tasks"] < 1 or c["completed_tasks"] < 1: missing.append("at least one completed outreach task")
+    if c["completed_outreach"] < 1: missing.append("a completed interview or site visit")
+    if c["evidence"] < 1: missing.append("supporting evidence")
+    if c["issues"] < 1: missing.append("a documented issue or validated finding")
+    if c["requirements"] < 1: missing.append("a product requirement")
+    if c["recommendations"] < 1: missing.append("a submitted recommendation")
+    if c["decisions"] < 1: missing.append("an IntelliAware decision")
+    return len(missing) == 0, missing, c
+
+
 def activity_entity_label(entity_type: str | None) -> str:
     labels = {
         "projects": "Project",
@@ -911,6 +1027,10 @@ def activity_entity_label(entity_type: str | None) -> str:
         "notifications": "Notification",
         "team_messages": "Team message",
         "users": "User account",
+        "product_requirements": "Product requirement",
+        "recommendations": "Recommendation",
+        "stakeholder_decisions": "IntelliAware decision",
+        "value_assessments": "Value assessment",
     }
     key = str(entity_type or "").lower()
     return labels.get(key, key.replace("_", " ").title() or "Activity")
@@ -954,6 +1074,10 @@ def activity_target_page(entity_type: str | None) -> str:
         "team_messages": "Messages",
         "users": "Administration",
         "app_sessions": "Administration",
+        "product_requirements": "Validation Workflow",
+        "recommendations": "Validation Workflow",
+        "stakeholder_decisions": "Validation Workflow",
+        "value_assessments": "Validation Workflow",
     }
     return mapping.get(str(entity_type or "").lower(), "Activity")
 
@@ -981,11 +1105,12 @@ except Exception as exc:
 
 # Individual authentication, RBAC and server-managed sessions.
 NAV_ITEMS = {
-    "Dashboard": ("⌂", "Portfolio overview, priorities, blockers and recent activity."),
+    "Dashboard": ("⌂", "Portfolio overview, workflow outcomes, value indicators and recent activity."),
+    "Validation Workflow": ("→", "Run the single field-validation workflow from outreach through IntelliAware decision."),
     "Portfolio Search": ("⌕", "Search projects, tasks, trials, issues, evidence and outreach."),
     "Projects": ("▣", "Create projects and manage objectives, teams, status and readiness."),
     "Workstreams": ("↳", "Split projects into owned workstreams and monitor progress."),
-    "My Work": ("✓", "View tasks assigned to your authenticated user account."),
+    "My Work": ("✓", "View workstreams you own and tasks assigned to your account."),
     "Milestones & Risks": ("◆", "Track delivery milestones, risks, mitigations and review dates."),
     "Trials": ("◉", "Plan, execute and follow validation trials through their lifecycle."),
     "Evidence": ("▤", "Register, review and verify trial evidence and technical artifacts."),
@@ -1360,7 +1485,7 @@ if page == "Administration" and current_user["role"] != "Administrator":
 st.query_params["page"] = page
 _safe_cookie_set(cookies, "validationops_page", page, max_age=60 * 60 * 24 * 30)
 
-st.markdown(f'<div class="appbar"><div><div class="appbar-title">IntelliAware ValidationOps</div><div class="appbar-meta">Validation operations, development remediation and deployment readiness</div></div><div class="appbar-meta"><strong>{current_user["display_name"]}</strong><br>{current_user["role"]} · {current_user.get("access_level", "Read")}</div></div>', unsafe_allow_html=True)
+st.markdown(f'<div class="appbar"><div><div class="appbar-title">IntelliAware ValidationOps</div><div class="appbar-meta">Industry outreach, field evidence, product requirements and decision traceability</div></div><div class="appbar-meta"><strong>{current_user["display_name"]}</strong><br>{current_user["role"]} · {current_user.get("access_level", "Read")}</div></div>', unsafe_allow_html=True)
 
 # -----------------------------
 # Dashboard
@@ -1383,6 +1508,10 @@ if page == "Dashboard":
     cols = st.columns(6)
     metrics = [("Active projects", len(p)), ("Active workstreams", int((~w.get("status", pd.Series(dtype=str)).astype(str).str.lower().isin(["completed", "closed"])).sum()) if not w.empty else 0), ("Open tasks", int((~t.get("status", pd.Series(dtype=str)).astype(str).str.lower().isin(["completed", "closed"])).sum()) if not t.empty else 0), ("Overdue", overdue), ("Open high/critical", critical), ("Trials", len(trials))]
     for c, (label, value) in zip(cols, metrics): c.metric(label, value)
+
+    flow = query_df("""SELECT COUNT(*) FILTER (WHERE LOWER(r.status) IN ('submitted','reviewed','decided')) AS submitted_recommendations, COUNT(DISTINCT d.id) AS decisions, COUNT(DISTINCT CASE WHEN d.decision='Accepted for development' THEN d.id END) AS accepted FROM recommendations r LEFT JOIN stakeholder_decisions d ON d.recommendation_id=r.id""")
+    if not flow.empty:
+        f=flow.iloc[0]; fc=st.columns(3); fc[0].metric("Recommendations submitted",int(f.get('submitted_recommendations') or 0)); fc[1].metric("IntelliAware decisions",int(f.get('decisions') or 0)); fc[2].metric("Accepted for development",int(f.get('accepted') or 0))
 
     left, right = st.columns([1.5, 1])
     with left:
@@ -1459,9 +1588,145 @@ elif page == "Portfolio Search":
         if found == 0: st.info("No matching records.")
 
 # -----------------------------
+# Single field-validation workflow
+# -----------------------------
+elif page == "Validation Workflow":
+    st.markdown("### IntelliAware field-validation workflow")
+    st.caption("One traceable branch: outreach task → contact → interview/site visit → evidence → issue → product requirement → recommendation → IntelliAware decision → workstream completion.")
+    pmap = project_options()
+    if not pmap:
+        st.info("Create a project first.")
+    else:
+        pname = st.selectbox("Project", list(pmap), key="flow_project")
+        pid = pmap[pname]
+        wsdf = query_df("SELECT w.*,t.name AS team_name FROM workstreams w LEFT JOIN teams t ON t.id=w.team_id WHERE w.project_id=:p ORDER BY w.name", {"p": pid})
+        if wsdf.empty:
+            st.info("Create an outreach and field-validation workstream for this project.")
+        else:
+            wsmap = {f"{r['name']} · {r.get('team_name') or 'No team'}": int(r['id']) for _,r in wsdf.iterrows()}
+            wslabel = st.selectbox("Workstream", list(wsmap), key="flow_ws")
+            wid = wsmap[wslabel]
+            ws = fetch_one("SELECT * FROM workstreams WHERE id=:id", {"id": wid})
+            counts = workflow_counts(pid, wid)
+            stages = [
+                ("1. Outreach task", counts["completed_tasks"] > 0, f"{counts['completed_tasks']} completed / {counts['tasks']} total"),
+                ("2. Interview or site visit", counts["completed_outreach"] > 0, f"{counts['completed_outreach']} completed / {counts['outreach']} recorded"),
+                ("3. Evidence", counts["evidence"] > 0, f"{counts['evidence']} records"),
+                ("4. Issue or validated finding", counts["issues"] > 0, f"{counts['issues']} records"),
+                ("5. Product requirement", counts["requirements"] > 0, f"{counts['requirements']} records"),
+                ("6. Submitted recommendation", counts["recommendations"] > 0, f"{counts['recommendations']} submitted"),
+                ("7. IntelliAware decision", counts["decisions"] > 0, f"{counts['decisions']} decisions"),
+            ]
+            completed = sum(1 for _,ok,_ in stages if ok)
+            st.progress(completed / len(stages), text=f"Workflow completion: {completed}/{len(stages)} stages")
+            cols = st.columns(4)
+            cols[0].metric("Completed engagements", counts["completed_outreach"])
+            cols[1].metric("Evidence records", counts["evidence"])
+            cols[2].metric("Requirements produced", counts["requirements"])
+            cols[3].metric("Decisions recorded", counts["decisions"])
+            for label, ok, detail in stages:
+                st.markdown(f"{'✅' if ok else '○'} **{label}** — {detail}")
+
+            tabs = st.tabs(["Traceability", "Requirements", "Recommendations", "Decision", "Value"])
+            with tabs[0]:
+                trace = query_df("""
+                    SELECT o.id AS outreach_id,o.company,o.contact_name,o.engagement_type,o.status AS outreach_status,o.engagement_date,
+                           e.id AS evidence_id,e.title AS evidence_title,
+                           i.id AS issue_id,i.title AS issue_title,i.status AS issue_status,
+                           pr.id AS requirement_id,pr.title AS requirement_title,pr.status AS requirement_status,
+                           rec.id AS recommendation_id,rec.title AS recommendation_title,rec.status AS recommendation_status,
+                           d.id AS decision_id,d.decision,d.decision_date
+                    FROM outreach_contacts o
+                    LEFT JOIN evidence_items e ON e.outreach_id=o.id AND e.workstream_id=o.workstream_id
+                    LEFT JOIN issue_logs i ON i.outreach_id=o.id AND i.workstream_id=o.workstream_id
+                    LEFT JOIN product_requirements pr ON pr.outreach_id=o.id AND pr.workstream_id=o.workstream_id
+                    LEFT JOIN recommendations rec ON rec.requirement_id=pr.id
+                    LEFT JOIN stakeholder_decisions d ON d.recommendation_id=rec.id
+                    WHERE o.project_id=:p AND o.workstream_id=:w ORDER BY o.id DESC
+                """, {"p": pid, "w": wid})
+                if trace.empty: st.info("No linked outreach records yet. Create the outreach task and engagement first.")
+                else: st.dataframe(trace, use_container_width=True, hide_index=True)
+
+            with tabs[1]:
+                issues = query_df("SELECT id,title,status,outreach_id,observed_behavior FROM issue_logs WHERE project_id=:p AND workstream_id=:w ORDER BY id DESC", {"p":pid,"w":wid})
+                if has_permission("issue.write") and not issues.empty:
+                    with st.form("create_requirement"):
+                        issue_map = {f"#{int(r['id'])} · {r.get('title') or 'Issue'}": int(r['id']) for _,r in issues.iterrows()}
+                        issue_label = st.selectbox("Source issue", list(issue_map)); issue_id = issue_map[issue_label]
+                        source_issue = fetch_one("SELECT * FROM issue_logs WHERE id=:id", {"id": issue_id}) or {}
+                        title = st.text_input("Requirement title")
+                        problem = st.text_area("Validated problem statement", value=source_issue.get("observed_behavior") or source_issue.get("title") or "")
+                        requirement = st.text_area("Product requirement", placeholder="IntelliAware should...")
+                        affected = st.text_input("Affected users / roles"); expected = st.text_area("Expected value")
+                        c1,c2=st.columns(2); priority=c1.selectbox("Priority",["Low","Medium","High","Critical"],index=1); status=c2.selectbox("Status",["Draft","Validated","Approved"])
+                        if st.form_submit_button("Create product requirement", type="primary"):
+                            if not title.strip() or not problem.strip() or not requirement.strip(): st.error("Title, problem statement, and requirement are required.")
+                            else:
+                                req_id=insert_record("product_requirements", {"project_id":pid,"workstream_id":wid,"outreach_id":source_issue.get("outreach_id"),"issue_id":issue_id,"title":title.strip(),"problem_statement":problem.strip(),"requirement_statement":requirement.strip(),"affected_users":affected.strip(),"expected_value":expected.strip(),"priority":priority,"status":status,"owner_user_id":ws.get("owner_user_id"),"created_by_user_id":actor_id}, actor, f"Product requirement '{title.strip()}' created from issue #{issue_id}")
+                                st.success(f"Requirement #{req_id} created."); st.rerun()
+                reqs=query_df("SELECT * FROM product_requirements WHERE project_id=:p AND workstream_id=:w ORDER BY id DESC",{"p":pid,"w":wid})
+                if reqs.empty: st.caption("No product requirements yet.")
+                else: st.dataframe(reqs[["id","title","problem_statement","requirement_statement","affected_users","expected_value","priority","status"]],use_container_width=True,hide_index=True)
+
+            with tabs[2]:
+                reqs=query_df("SELECT * FROM product_requirements WHERE project_id=:p AND workstream_id=:w ORDER BY id DESC",{"p":pid,"w":wid})
+                if has_permission("issue.write") and not reqs.empty:
+                    with st.form("create_recommendation"):
+                        req_map={f"#{int(r['id'])} · {r['title']}":int(r['id']) for _,r in reqs.iterrows()}; req_label=st.selectbox("Requirement",list(req_map)); req_id=req_map[req_label]
+                        title=st.text_input("Recommendation title"); recommendation=st.text_area("Recommendation to IntelliAware"); evidence_summary=st.text_area("Evidence summary"); expected=st.text_area("Expected value to IntelliAware")
+                        priority=st.selectbox("Proposed priority",["Low","Medium","High","Critical"],index=1); submit_now=st.checkbox("Submit for IntelliAware decision",value=True)
+                        if st.form_submit_button("Create recommendation",type="primary"):
+                            if not title.strip() or not recommendation.strip(): st.error("Recommendation title and text are required.")
+                            else:
+                                status="Submitted" if submit_now else "Draft"
+                                insert_record("recommendations",{"project_id":pid,"workstream_id":wid,"requirement_id":req_id,"title":title.strip(),"recommendation_text":recommendation.strip(),"evidence_summary":evidence_summary.strip(),"expected_value":expected.strip(),"proposed_priority":priority,"status":status,"submitted_by_user_id":actor_id,"submitted_at":datetime.utcnow() if submit_now else None},actor,f"Recommendation '{title.strip()}' {status.lower()}");st.rerun()
+                recs=query_df("SELECT r.*,pr.title AS requirement_title FROM recommendations r JOIN product_requirements pr ON pr.id=r.requirement_id WHERE r.project_id=:p AND r.workstream_id=:w ORDER BY r.id DESC",{"p":pid,"w":wid})
+                if recs.empty: st.caption("No recommendations yet.")
+                else: st.dataframe(recs[["id","title","requirement_title","recommendation_text","expected_value","proposed_priority","status","submitted_at"]],use_container_width=True,hide_index=True)
+
+            with tabs[3]:
+                recs=query_df("SELECT * FROM recommendations WHERE project_id=:p AND workstream_id=:w AND LOWER(status) IN ('submitted','reviewed','decided') ORDER BY id DESC",{"p":pid,"w":wid})
+                if can_edit_workstream(ws) and not recs.empty:
+                    with st.form("record_decision"):
+                        rec_map={f"#{int(r['id'])} · {r['title']}":int(r['id']) for _,r in recs.iterrows()}; rec_label=st.selectbox("Recommendation",list(rec_map)); rec_id=rec_map[rec_label]
+                        decision=st.selectbox("IntelliAware decision",["Accepted for development","Needs further validation","Deferred","Rejected","Converted into a new project","Converted into a new workstream"])
+                        maker=st.text_input("Decision maker"); decision_date=st.date_input("Decision date",value=date.today()); comments=st.text_area("Decision comments"); next_action=st.text_area("Next action")
+                        if st.form_submit_button("Record decision",type="primary"):
+                            if not maker.strip(): st.error("Decision maker is required.")
+                            else:
+                                did=insert_record("stakeholder_decisions",{"project_id":pid,"workstream_id":wid,"recommendation_id":rec_id,"decision":decision,"decision_maker":maker.strip(),"decision_date":decision_date,"comments":comments.strip(),"next_action":next_action.strip(),"created_by_user_id":actor_id},actor,f"IntelliAware decision recorded: {decision}")
+                                update_record("recommendations",rec_id,{"status":"Decided","updated_at":datetime.utcnow()},actor,f"Recommendation moved to Decided after decision #{did}");st.rerun()
+                decisions=query_df("SELECT d.*,r.title AS recommendation_title FROM stakeholder_decisions d JOIN recommendations r ON r.id=d.recommendation_id WHERE d.project_id=:p AND d.workstream_id=:w ORDER BY d.decision_date DESC,d.id DESC",{"p":pid,"w":wid})
+                if decisions.empty: st.caption("No IntelliAware decision recorded yet.")
+                else: st.dataframe(decisions[["decision_date","recommendation_title","decision","decision_maker","comments","next_action"]],use_container_width=True,hide_index=True)
+
+            with tabs[4]:
+                st.markdown("#### Measure the value of the team's work")
+                st.caption("Use measurable before/current/target values: stakeholder interviews completed, validated pain points, requirements accepted, estimated troubleshooting time saved, or avoided discovery effort.")
+                if has_permission("readiness.write"):
+                    with st.form("value_assessment"):
+                        c1,c2,c3=st.columns(3); metric=c1.text_input("Metric"); baseline=c2.number_input("Baseline",value=0.0); current=c3.number_input("Current",value=0.0)
+                        target=c1.number_input("Target",value=0.0); unit=c2.text_input("Unit"); category=c3.selectbox("Value category",["Customer discovery","Product direction","Operational","Time","Cost","Risk reduction"])
+                        method=st.text_input("Measurement method"); confidence=st.selectbox("Confidence",["Low","Medium","High"],index=1); evidence_note=st.text_area("Evidence / calculation note")
+                        if st.form_submit_button("Add value measure",type="primary"):
+                            if not metric.strip(): st.error("Metric is required.")
+                            else: insert_record("value_assessments",{"project_id":pid,"workstream_id":wid,"metric_name":metric.strip(),"baseline_value":baseline,"current_value":current,"target_value":target,"unit":unit.strip(),"value_category":category,"measurement_method":method.strip(),"confidence":confidence,"evidence_note":evidence_note.strip(),"recorded_by_user_id":actor_id},actor,f"Value measure '{metric.strip()}' added");st.rerun()
+                vals=query_df("SELECT * FROM value_assessments WHERE project_id=:p AND workstream_id=:w ORDER BY id DESC",{"p":pid,"w":wid})
+                if vals.empty: st.caption("No value measurements yet.")
+                else:
+                    display=vals[["metric_name","value_category","baseline_value","current_value","target_value","unit","measurement_method","confidence","evidence_note"]].copy()
+                    display["target_progress_%"]=display.apply(lambda r: ((float(r["current_value"])-float(r["baseline_value"]))/(float(r["target_value"])-float(r["baseline_value"]))*100) if r["target_value"] is not None and r["baseline_value"] is not None and float(r["target_value"])!=float(r["baseline_value"]) else None,axis=1)
+                    st.dataframe(display,use_container_width=True,hide_index=True)
+
+            ready, missing, _ = workflow_completion_check(pid,wid)
+            if ready: st.success("This branch has the required traceability and may be closed by the workstream owner, team lead, or administrator.")
+            else: st.warning("Workstream closure is blocked until these items exist: " + ", ".join(missing) + ".")
+
+# -----------------------------
 # Projects
 # -----------------------------
 elif page == "Projects":
+
     st.markdown("### Projects")
     if can_edit:
         with st.expander("Create project", expanded=False):
@@ -1510,10 +1775,19 @@ elif page == "Projects":
                     phase=c2.selectbox("Phase", phase_opts, index=phase_opts.index(project.get("phase")) if project.get("phase") in phase_opts else 0)
                     status=c1.selectbox("Status", ["Active","At risk","Blocked","On hold","Completed"])
                     readiness=c2.selectbox("Readiness", ["Not assessed","Not ready","More validation required","Conditionally ready","Ready"])
+                    pd1,pd2=st.columns(2)
+                    start_date=pd1.date_input("Start date", value=parse_optional_date(project.get("start_date")))
+                    target_date=pd2.date_input("Target date", value=parse_optional_date(project.get("target_date")))
                     description=st.text_area("Description", project.get("description") or "")
                     if st.form_submit_button("Save changes", type="primary"):
-                        update_record("projects", project_id, {"name":name,"owner":owner,"owner_user_id":owner_user_id,"priority":priority,"phase":phase,"status":status,"readiness_level":readiness,"description":description,"updated_at":datetime.utcnow()}, actor, f"Project '{name}' updated")
-                        st.success("Saved."); st.rerun()
+                        invalid_ws = query_df("""SELECT id,name,start_date,due_date FROM workstreams WHERE project_id=:p AND ((:start IS NOT NULL AND start_date < :start) OR (:target IS NOT NULL AND due_date > :target))""", {"p": project_id, "start": start_date, "target": target_date})
+                        if start_date and target_date and start_date > target_date:
+                            st.error("Project start date cannot be after its target date.")
+                        elif not invalid_ws.empty:
+                            st.error("These dates would place existing workstreams outside the project window. Update those workstreams first: " + ", ".join(invalid_ws["name"].astype(str).tolist()))
+                        else:
+                            update_record("projects", project_id, {"name":name,"owner":owner,"owner_user_id":owner_user_id,"priority":priority,"phase":phase,"status":status,"readiness_level":readiness,"start_date":start_date,"target_date":target_date,"description":description,"updated_at":datetime.utcnow()}, actor, f"Project '{name}' updated")
+                            st.success("Saved."); st.rerun()
         with tabs[2]:
             teams=team_options(); linked=query_df("SELECT pt.id, t.name, pt.responsibility FROM project_teams pt JOIN teams t ON t.id=pt.team_id WHERE pt.project_id=:p", {"p":project_id})
             st.dataframe(linked, use_container_width=True, hide_index=True)
@@ -1558,16 +1832,23 @@ elif page == "Workstreams":
                         description = st.text_area("Description")
                         deps = st.text_area("Dependencies / blockers")
                         if st.form_submit_button("Create workstream", type="primary"):
+                            date_error = validate_workstream_dates(pid, start_date, due)
                             if not name.strip():
                                 st.error("Workstream name is required.")
+                            elif not owner_user_id:
+                                st.error("Assign a workstream owner so it appears in that user's My Work page.")
+                            elif date_error:
+                                st.error(date_error)
                             else:
-                                insert_record("workstreams", {"project_id": pid, "name": name.strip(), "owner": owner, "owner_user_id": owner_user_id, "team_id": active_teams.get(team_name), "priority": priority, "start_date": start_date, "due_date": due, "description": description, "dependency_notes": deps}, actor, f"Workstream '{name.strip()}' created")
+                                workstream_id = insert_record("workstreams", {"project_id": pid, "name": name.strip(), "owner": owner, "owner_user_id": owner_user_id, "team_id": active_teams.get(team_name), "priority": priority, "start_date": start_date, "due_date": due, "description": description, "dependency_notes": deps}, actor, f"Workstream '{name.strip()}' created")
+                                create_notification(owner_user_id, "Workstream ownership assigned", f"{actor} assigned you ownership of '{name.strip()}'. It is now available in My Work.", "workstreams", workstream_id, actor_id, "My Work")
                                 st.rerun()
 
             ws = query_df("SELECT w.*, t.name AS team_name FROM workstreams w LEFT JOIN teams t ON t.id=w.team_id WHERE w.project_id=:p ORDER BY w.id DESC", {"p": pid})
             for _, r in ws.iterrows():
                 render_card(safe_text(r.get("name"), "Unnamed workstream"), f"Owner: {safe_text(r.get('owner'), 'Unassigned')} · Team: {safe_text(r.get('team_name'), 'Unassigned')}", [r.get("status"), r.get("priority"), f"{r.get('progress') or 0}%"], safe_text(r.get("dependency_notes"), ""))
-                if can_edit:
+                ws_edit_allowed = can_edit_workstream(r)
+                if ws_edit_allowed:
                     with st.expander(f"Edit {r['name']}"):
                         with st.form(f"ws_{r['id']}"):
                             c1, c2 = st.columns(2)
@@ -1595,11 +1876,25 @@ elif page == "Workstreams":
                             description = st.text_area("Description", r.get("description") or "", key=f"wsdesc{r['id']}")
                             deps = st.text_area("Dependencies / blockers", r.get("dependency_notes") or "", key=f"wsdep{r['id']}")
                             if st.form_submit_button("Save workstream", type="primary"):
+                                date_error = validate_workstream_dates(int(r["project_id"]), start_date, due_date)
+                                ready_to_close, missing, _counts = workflow_completion_check(int(r["project_id"]), int(r["id"]))
                                 if not edit_name.strip():
                                     st.error("Workstream name is required.")
+                                elif not owner_user_id:
+                                    st.error("A workstream owner is required.")
+                                elif date_error:
+                                    st.error(date_error)
+                                elif status == "Completed" and not ready_to_close:
+                                    st.error("This workstream cannot be completed yet. Missing: " + ", ".join(missing) + ".")
                                 else:
-                                    update_record("workstreams", int(r["id"]), {"name": edit_name.strip(), "owner": owner_name, "owner_user_id": owner_user_id, "team_id": team_map.get(team_label), "priority": priority, "start_date": start_date, "due_date": due_date, "status": status, "progress": progress, "description": description, "dependency_notes": deps, "updated_at": datetime.utcnow()}, actor, f"Workstream '{edit_name.strip()}' updated")
+                                    old_owner_id = r.get("owner_user_id")
+                                    update_record("workstreams", int(r["id"]), {"name": edit_name.strip(), "owner": owner_name, "owner_user_id": owner_user_id, "team_id": team_map.get(team_label), "priority": priority, "start_date": start_date, "due_date": due_date, "status": status, "progress": 100 if status == "Completed" else progress, "description": description, "dependency_notes": deps, "updated_at": datetime.utcnow()}, actor, f"Workstream '{edit_name.strip()}' updated")
+                                    if owner_user_id and owner_user_id != old_owner_id:
+                                        create_notification(owner_user_id, "Workstream ownership assigned", f"{actor} assigned you ownership of '{edit_name.strip()}'.", "workstreams", int(r["id"]), actor_id, "My Work")
                                     st.rerun()
+
+                elif can_edit and not ws_edit_allowed:
+                    st.caption("Only the workstream owner, the assigned team's lead, or an administrator can edit this workstream.")
 
     with team_tab:
         can_create_team = current_user["role"] == "Administrator" or user_leads_team(actor_id)
@@ -1689,7 +1984,7 @@ elif page == "Workstreams":
 elif page == "My Work":
     project_map = project_options()
     st.markdown("### My Work")
-    st.caption("Tasks are linked to your authenticated account. Team-aware assignment limits assignees to active members of the selected workstream team.")
+    st.caption("Owned workstreams and assigned tasks are linked to your authenticated account. Task assignment is limited to active members of the selected workstream team.")
 
     can_create_task = has_permission("task.write")
     if can_create_task and project_map:
@@ -1726,7 +2021,29 @@ elif page == "My Work":
                             notify_team_leads(team_id, "Task assigned", f"{actor} assigned '{title.strip()}' to {assignee_user['display_name']}.", "tasks", task_id, actor_id)
                             st.rerun()
 
-    mine_tab, team_tab = st.tabs(["My assigned tasks", "Team tasks"])
+    owned_tab, mine_tab, team_tab = st.tabs(["My owned workstreams", "My assigned tasks", "Team tasks"])
+    with owned_tab:
+        owned = query_df("""
+            SELECT w.*,p.name AS project_name,t.name AS team_name
+            FROM workstreams w LEFT JOIN projects p ON p.id=w.project_id LEFT JOIN teams t ON t.id=w.team_id
+            WHERE w.owner_user_id=:uid ORDER BY w.due_date NULLS LAST,w.updated_at DESC
+        """, {"uid": actor_id})
+        if owned.empty:
+            st.info("You do not currently own a workstream.")
+        for _, r in owned.iterrows():
+            ready, missing, counts = workflow_completion_check(int(r["project_id"]), int(r["id"]))
+            render_card(safe_text(r.get("name")), f"{safe_text(r.get('project_name'),'No project')} · Team: {safe_text(r.get('team_name'),'Unassigned')}", [r.get("status"), f"{r.get('progress') or 0}%", "Closure ready" if ready else "Workflow open"], safe_text(r.get("description"), ""))
+            with st.expander("Open workstream summary"):
+                st.write(f"**Dates:** {r.get('start_date') or 'Not set'} → {r.get('due_date') or 'Not set'}")
+                st.write(f"**Workflow records:** {counts['completed_outreach']} completed engagements · {counts['evidence']} evidence · {counts['issues']} issues · {counts['requirements']} requirements · {counts['recommendations']} submitted recommendations · {counts['decisions']} decisions")
+                if not ready:
+                    st.caption("Needed before completion: " + ", ".join(missing))
+                if st.button("Open in Workstreams", key=f"open_owned_ws_{r['id']}"):
+                    st.session_state.current_page = "Workstreams"
+                    st.query_params["page"] = "Workstreams"
+                    st.query_params["record_id"] = str(int(r["id"]))
+                    st.rerun()
+
     with mine_tab:
         tasks = query_df("""
             SELECT tk.*, p.name project_name, w.name workstream_name,te.name team_name
@@ -1740,7 +2057,8 @@ elif page == "My Work":
             render_card(safe_text(r.get("title")), f"{safe_text(r.get('project_name'), 'No project')} · {safe_text(r.get('workstream_name'), 'No workstream')} · {safe_text(r.get('team_name'), 'No team')}", [r.get("status"), r.get("priority"), str(r.get("due_date") or "No due date")], safe_text(r.get("description"), ""))
             with st.expander("Open task"):
                 st.write(f"**Completion criteria:** {r.get('completion_criteria') or 'Not defined'}")
-                if has_permission("task.write"):
+                task_edit_allowed = current_user["role"] == "Administrator" or int(r.get("assignee_user_id") or 0) == actor_id or user_leads_team(actor_id, int(r["team_id"]) if r.get("team_id") else None)
+                if task_edit_allowed:
                     with st.form(f"task_{r['id']}"):
                         status_opts = ["Backlog", "Ready", "In progress", "Blocked", "Under review", "Completed"]
                         status = st.selectbox("Status", status_opts, index=status_opts.index(r.get("status")) if r.get("status") in status_opts else 0)
@@ -1752,7 +2070,7 @@ elif page == "My Work":
                             update_record("tasks", int(r["id"]), vals, actor, note or f"Task '{r['title']}' moved from {old_status} to {status}")
                             notify_team_leads(int(r["team_id"]) if r.get("team_id") else None, "Task status changed", f"{actor} changed '{r['title']}' from {old_status} to {status}. {note}".strip(), "tasks", int(r["id"]), actor_id)
                             st.rerun()
-                comments_panel("tasks", int(r["id"]), actor, True)
+                comments_panel("tasks", int(r["id"]), actor, can_edit)
                 record_timeline("tasks", int(r["id"]))
 
     with team_tab:
@@ -1907,8 +2225,16 @@ elif page == "Evidence":
             with st.form("evidence_create"):
                 c1, c2 = st.columns(2)
                 title = c1.text_input("Evidence title")
-                etype = c2.selectbox("Type", ["Video", "Image", "Model output", "Sensor log", "Ground truth", "Calibration", "Operator feedback", "Report", "Other"])
+                etype = c2.selectbox("Type", ["Interview notes", "Site observation", "Video", "Image", "Model output", "Sensor log", "Ground truth", "Calibration", "Operator feedback", "Report", "Other"])
                 trial_label = c1.selectbox("Related trial", ["Project-level / none"] + list(trial_map))
+                ws_df = query_df("SELECT id,name FROM workstreams WHERE project_id=:p ORDER BY name", {"p": pid}) if pid else pd.DataFrame()
+                ws_map = {r["name"]: int(r["id"]) for _,r in ws_df.iterrows()}
+                ws_label = c2.selectbox("Workstream", ["Unlinked"] + list(ws_map))
+                workstream_id = ws_map.get(ws_label)
+                outreach_df = query_df("SELECT id,company,contact_name FROM outreach_contacts WHERE project_id=:p AND (:w IS NULL OR workstream_id=:w) ORDER BY id DESC", {"p":pid,"w":workstream_id}) if pid else pd.DataFrame()
+                outreach_map = {f"#{int(r['id'])} · {r['company']} · {r.get('contact_name') or ''}": int(r['id']) for _,r in outreach_df.iterrows()}
+                outreach_label = c1.selectbox("Source interview / site visit", ["Unlinked"] + list(outreach_map))
+                outreach_id = outreach_map.get(outreach_label)
                 source = c2.text_input("Source / system")
                 uri = st.text_input("Public file or repository link", help="Use a complete public or organization-accessible HTTPS link. Do not enter N/A or a local computer path.")
                 version = c1.text_input("Model/software version")
@@ -1921,7 +2247,7 @@ elif page == "Evidence":
                     elif uri.strip() and not normalized_uri:
                         st.error("Enter a valid HTTPS link or leave the field blank. Placeholder values and local paths are not accepted.")
                     else:
-                        insert_record("evidence_items", {"project_id": pid, "trial_id": trial_map.get(trial_label), "title": title.strip(), "evidence_type": etype, "source": source.strip(), "uri": normalized_uri, "model_version": version.strip(), "verification_status": status, "description": desc.strip(), "uploaded_by": actor, "uploaded_by_user_id": actor_id}, actor, f"Evidence '{title.strip()}' registered")
+                        insert_record("evidence_items", {"project_id": pid, "workstream_id": workstream_id, "outreach_id": outreach_id, "trial_id": trial_map.get(trial_label), "title": title.strip(), "evidence_type": etype, "source": source.strip(), "uri": normalized_uri, "model_version": version.strip(), "verification_status": status, "description": desc.strip(), "uploaded_by": actor, "uploaded_by_user_id": actor_id}, actor, f"Evidence '{title.strip()}' registered")
                         st.rerun()
     f1, f2 = st.columns(2)
     project_filter = f1.selectbox("Project filter", ["All"] + list(pmap))
@@ -1969,9 +2295,12 @@ elif page == "Issues":
                 c1,c2=st.columns(2); issue_id=c1.text_input("Issue key",value=f"ISS-{datetime.now().strftime('%H%M%S')}"); title=c2.text_input("Title")
                 severity=c1.selectbox("Severity",["Low","Medium","High","Critical"]); priority=c2.selectbox("Priority",["Low","Medium","High","Critical"],index=1)
                 issue_users=user_options(); owner_label=c1.selectbox("Owner", ["Unassigned"]+list(issue_users)); owner_user_id=issue_users.get(owner_label); owner=(user_by_id(owner_user_id) or {}).get("display_name", "") if owner_user_id else ""; environment=c2.text_input("Environment")
-                observed=st.text_area("Observed behavior"); expected=st.text_area("Expected behavior"); fix=st.text_area("Suggested action / fix")
+                ws_df=query_df("SELECT id,name FROM workstreams WHERE project_id=:p ORDER BY name",{"p":pid}) if pid else pd.DataFrame(); ws_map={r['name']:int(r['id']) for _,r in ws_df.iterrows()}; ws_label=c1.selectbox("Workstream",["Unlinked"]+list(ws_map)); workstream_id=ws_map.get(ws_label)
+                outreach_df=query_df("SELECT id,company,contact_name FROM outreach_contacts WHERE project_id=:p AND (:w IS NULL OR workstream_id=:w) ORDER BY id DESC",{"p":pid,"w":workstream_id}) if pid else pd.DataFrame(); outreach_map={f"#{int(r['id'])} · {r['company']} · {r.get('contact_name') or ''}":int(r['id']) for _,r in outreach_df.iterrows()}; outreach_label=c2.selectbox("Source interview / site visit",["Unlinked"]+list(outreach_map)); outreach_id=outreach_map.get(outreach_label)
+                evidence_df=query_df("SELECT id,title FROM evidence_items WHERE project_id=:p AND (:w IS NULL OR workstream_id=:w) AND (:o IS NULL OR outreach_id=:o) ORDER BY id DESC",{"p":pid,"w":workstream_id,"o":outreach_id}) if pid else pd.DataFrame(); evidence_map={f"#{int(r['id'])} · {r['title']}":int(r['id']) for _,r in evidence_df.iterrows()}; evidence_label=st.selectbox("Supporting evidence",["Unlinked"]+list(evidence_map)); evidence_id=evidence_map.get(evidence_label)
+                observed=st.text_area("Observed problem / validated finding"); expected=st.text_area("Desired condition"); fix=st.text_area("Initial product implication")
                 if st.form_submit_button("Create issue") and title:
-                    insert_record("issue_logs",{"issue_id":issue_id,"title":title,"project_id":pid,"severity":severity,"priority":priority,"owner":owner,"owner_user_id":owner_user_id,"environment":environment,"observed_behavior":observed,"expected_behavior":expected,"suggested_fix":fix,"status":"Reported"},actor,f"Issue {issue_id} created")
+                    insert_record("issue_logs",{"issue_id":issue_id,"title":title,"project_id":pid,"workstream_id":workstream_id,"outreach_id":outreach_id,"evidence_id":evidence_id,"severity":severity,"priority":priority,"owner":owner,"owner_user_id":owner_user_id,"environment":environment,"observed_behavior":observed,"expected_behavior":expected,"suggested_fix":fix,"status":"Reported"},actor,f"Issue {issue_id} created")
                     st.rerun()
     issues=query_df("SELECT i.*,p.name project_name FROM issue_logs i LEFT JOIN projects p ON p.id=i.project_id ORDER BY CASE LOWER(i.severity) WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 ELSE 4 END,i.id DESC")
     f1,f2,f3=st.columns(3); sev_filter=f1.selectbox("Severity",["All","Critical","High","Medium","Low"]); status_filter=f2.selectbox("Status",["All","Reported","Triaged","Assigned","Under investigation","Root cause identified","Fix in progress","Ready for retest","Retesting","Verified","Closed","Deferred"]); owner_filter=f3.text_input("Owner contains")
@@ -2015,6 +2344,9 @@ elif page == "Outreach":
                 contact_owner_user_id = outreach_users.get(owner_label) if owner_label else None
                 owner = (user_by_id(contact_owner_user_id) or {}).get("display_name", actor)
                 process = c2.text_input("Process / topic")
+                ws_df=query_df("SELECT id,name FROM workstreams WHERE project_id=:p ORDER BY name",{"p":pid}) if pid else pd.DataFrame(); ws_map={r['name']:int(r['id']) for _,r in ws_df.iterrows()}; ws_label=c1.selectbox("Workstream",["Unlinked"]+list(ws_map)); workstream_id=ws_map.get(ws_label)
+                task_df=query_df("SELECT id,title FROM tasks WHERE project_id=:p AND (:w IS NULL OR workstream_id=:w) ORDER BY title",{"p":pid,"w":workstream_id}) if pid else pd.DataFrame(); task_map={r['title']:int(r['id']) for _,r in task_df.iterrows()}; task_label=c2.selectbox("Outreach task",["Unlinked"]+list(task_map)); task_id=task_map.get(task_label)
+                engagement_type=c1.selectbox("Engagement type",["Interview","Site visit","Product feedback meeting","Follow-up call","Email exchange"]); engagement_date=c2.date_input("Engagement date",value=None)
                 latest_touch = c1.date_input("Latest touchpoint", value=None)
                 follow_up = c2.date_input("Follow-up date", value=None)
                 next_action = st.text_input("Next action")
@@ -2023,13 +2355,13 @@ elif page == "Outreach":
                     if not company.strip():
                         st.error("Company is required.")
                     else:
-                        insert_record("outreach_contacts", {"project_id": pid, "company": company.strip(), "contact_name": contact.strip(), "contact_owner": owner, "contact_owner_user_id": contact_owner_user_id, "process_type": process, "status": "Identified", "next_action": next_action, "notes": notes, "latest_touchpoint_date": latest_touch, "last_touchpoint": latest_touch.isoformat() if latest_touch else None, "follow_up_date": follow_up}, actor, f"Outreach thread for {company.strip()} created")
+                        insert_record("outreach_contacts", {"project_id": pid, "workstream_id": workstream_id, "task_id": task_id, "engagement_type": engagement_type, "engagement_date": engagement_date, "company": company.strip(), "contact_name": contact.strip(), "contact_owner": owner, "contact_owner_user_id": contact_owner_user_id, "process_type": process, "status": "Identified", "next_action": next_action, "notes": notes, "latest_touchpoint_date": latest_touch, "last_touchpoint": latest_touch.isoformat() if latest_touch else None, "follow_up_date": follow_up}, actor, f"Outreach thread for {company.strip()} created")
                         st.rerun()
 
     f1, f2, f3, f4 = st.columns(4)
     search = f1.text_input("Search company or contact")
     project_filter = f2.selectbox("Project", ["All"] + list(project_map))
-    status_opts = ["All", "Identified", "Contact pending", "Contacted", "Follow-up due", "Response received", "Meeting scheduled", "Access confirmed", "Closed"]
+    status_opts = ["All", "Identified", "Contacted", "Awaiting response", "Follow-up required", "Meeting scheduled", "Interview completed", "Visit completed", "Needs clarification", "No response", "Closed"]
     status_filter = f3.selectbox("Status", status_opts)
     owner_filter = f4.text_input("Owner contains")
     sql = "SELECT o.*,p.name project_name FROM outreach_contacts o LEFT JOIN projects p ON p.id=o.project_id WHERE 1=1"; params = {}
@@ -2045,7 +2377,10 @@ elif page == "Outreach":
         with st.expander("Open thread"):
             st.write(f"**Last touchpoint:** {r.get('latest_touchpoint_date') or r.get('last_touchpoint') or '—'}")
             st.write(f"**Follow-up:** {r.get('follow_up_date') or '—'}")
+            st.write(f"**Engagement:** {r.get('engagement_type') or '—'} · {r.get('engagement_date') or 'Date not set'}")
             st.write(f"**Notes:** {safe_text(r.get('notes'))}")
+            st.write(f"**Findings:** {safe_text(r.get('findings_summary'))}")
+            st.write(f"**Value to IntelliAware:** {safe_text(r.get('feedback_value'))}")
             if can_edit:
                 with st.form(f"outreach_{r['id']}"):
                     status = st.selectbox("Status", status_opts[1:], index=status_opts[1:].index(r.get("status")) if r.get("status") in status_opts[1:] else 0)
@@ -2054,9 +2389,12 @@ elif page == "Outreach":
                     follow = c2.date_input("Follow-up date", value=parse_optional_date(r.get("follow_up_date")))
                     next_action = st.text_input("Next action", r.get("next_action") or "")
                     notes = st.text_area("Notes", r.get("notes") or "")
+                    findings = st.text_area("Findings summary", r.get("findings_summary") or "")
+                    feedback_value = st.text_area("Value of this feedback to IntelliAware", r.get("feedback_value") or "")
                     note = st.text_area("Update note")
                     if st.form_submit_button("Save outreach update"):
-                        update_record("outreach_contacts", int(r["id"]), {"status": status, "latest_touchpoint_date": touch, "last_touchpoint": touch.isoformat() if touch else None, "follow_up_date": follow, "next_action": next_action, "notes": notes, "updated_at": datetime.utcnow()}, actor, note or f"Outreach status moved to {status}")
+                        completed_at = datetime.utcnow() if status in ["Interview completed","Visit completed","Closed"] else r.get("completed_at")
+                        update_record("outreach_contacts", int(r["id"]), {"status": status, "latest_touchpoint_date": touch, "last_touchpoint": touch.isoformat() if touch else None, "follow_up_date": follow, "next_action": next_action, "notes": notes, "findings_summary": findings, "feedback_value": feedback_value, "completed_at": completed_at, "updated_at": datetime.utcnow()}, actor, note or f"Outreach status moved to {status}")
                         st.rerun()
             comments_panel("outreach_contacts", int(r["id"]), actor, can_edit)
             record_timeline("outreach_contacts", int(r["id"]))
@@ -2610,6 +2948,18 @@ Generated: {datetime.now().isoformat()}
 
 ## Success criteria
 {project.get('success_criteria') or 'Not defined'}
+"""
+        reqs=query_df("SELECT * FROM product_requirements WHERE project_id=:p",{"p":pid}); recs=query_df("SELECT * FROM recommendations WHERE project_id=:p",{"p":pid}); decisions=query_df("SELECT * FROM stakeholder_decisions WHERE project_id=:p",{"p":pid}); vals=query_df("SELECT * FROM value_assessments WHERE project_id=:p",{"p":pid})
+        report += f"""
+## Field-validation outcomes
+- Product requirements produced: {len(reqs)}
+- Recommendations submitted: {0 if recs.empty else int(recs['status'].astype(str).str.lower().isin(['submitted','reviewed','decided']).sum())}
+- IntelliAware decisions recorded: {len(decisions)}
+- Recommendations accepted for development: {0 if decisions.empty else int((decisions['decision']=='Accepted for development').sum())}
+- Quantified value measures: {len(vals)}
+
+## Traceability statement
+Outreach and field observations are linked to evidence, issues, product requirements, recommendations, and IntelliAware decisions. Workstreams cannot be closed until the required workflow stages are present.
 """
         st.download_button("Download management report",report,file_name=f"{project.get('code') or 'project'}_validation_report.md",mime="text/markdown",type="primary")
         st.markdown(report)
